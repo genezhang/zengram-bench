@@ -3,6 +3,7 @@ dist/
 # Ignore result data but keep the placeholder dirs so they exist after clone
 results/runs/*.json
 results/scores/*.json
+results/repo-cache/
 tasks/cache/*.json
 __pycache__/
 *.pyc

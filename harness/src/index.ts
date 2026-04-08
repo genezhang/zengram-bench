@@ -39,6 +39,7 @@ program
   .option("--filter <ids>", "comma-separated task IDs to run (subset of --tasks)")
   .option("--concurrency <n>", "number of tasks to run in parallel", "1")
   .option("--dry-run", "print what would run without invoking agents", false)
+  .option("--skip-disk-check", "skip the free-disk-space preflight check", false)
   .action(async (opts) => {
     const variants = (opts.variants as string)
       .split(",")
@@ -48,6 +49,10 @@ program
     const taskFilter = opts.filter
       ? (opts.filter as string).split(",").map((s: string) => s.trim())
       : undefined;
+
+    if (!opts.skipDiskCheck) {
+      await checkDiskSpace();
+    }
 
     await runBenchmark({
       subsetFile: opts.tasks as string,
@@ -112,3 +117,37 @@ program
   });
 
 program.parse();
+
+// ── Preflight ─────────────────────────────────────────────────────────────────
+
+async function checkDiskSpace(): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execAsync = promisify(execFile);
+
+  try {
+    // df -k gives 1 KB blocks; available is column 4 of the data row.
+    const { stdout } = await execAsync("df", ["-k", "."]);
+    const lines = stdout.trim().split("\n");
+    const dataLine = lines[lines.length - 1]!;
+    const available_kb = parseInt(dataLine.trim().split(/\s+/)[3]!, 10);
+    const available_gb = available_kb / 1024 / 1024;
+
+    // Estimate: one bare clone of django ≈ 200 MB; per-run working copy via
+    // hardlinks ≈ near-zero extra. Scorer pip installs ≈ 100 MB per run.
+    // Warn below 10 GB; hard-stop below 5 GB.
+    if (available_gb < 5) {
+      console.error(`\nERROR: only ${available_gb.toFixed(1)} GB free. Need at least 5 GB.`);
+      console.error(`Free up space or use --skip-disk-check to override.`);
+      process.exit(1);
+    }
+    if (available_gb < 10) {
+      console.warn(`\nWARNING: only ${available_gb.toFixed(1)} GB free (recommended ≥ 10 GB).`);
+      console.warn(`Run will proceed — watch disk usage during scoring.\n`);
+    } else {
+      console.log(`Disk: ${available_gb.toFixed(1)} GB free — OK\n`);
+    }
+  } catch {
+    // Non-fatal; df may not be available everywhere.
+  }
+}

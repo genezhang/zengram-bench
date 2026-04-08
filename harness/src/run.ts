@@ -24,6 +24,7 @@ import type { RunResult, SweTask, Variant } from "./types.js";
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(fileURLToPath(import.meta.url), "../../..");
 const RESULTS_DIR = path.join(ROOT, "results", "runs");
+const CLONE_CACHE  = path.join(ROOT, "results", "repo-cache");  // gitignored bare clones
 
 export interface RunOptions {
   subsetFile?: string;
@@ -93,12 +94,42 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
   console.log(`Next: cd harness/scorer && python score.py`);
 }
 
-// ── Repo setup ────────────────────────────────────────────────────────────────
+// ── Repo setup (with shared clone cache) ─────────────────────────────────────
+//
+// Strategy: keep one bare clone per repo under results/repo-cache/.
+// Each run gets a local clone from the cache (git uses hardlinks → fast,
+// near-zero extra disk). This cuts network traffic from O(runs) to O(repos).
+
+// Serialise per-repo cache initialisation so concurrent tasks for the same
+// repo don't race to create the bare clone.
+const cacheInitLocks = new Map<string, Promise<string>>();
+
+async function ensureCache(repo: string): Promise<string> {
+  const cacheDir = path.join(CLONE_CACHE, repo.replace("/", "__"));
+  if (!cacheInitLocks.has(repo)) {
+    cacheInitLocks.set(repo, (async () => {
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
+        console.log(`    [cache] cloning ${repo} …`);
+        await execFileAsync("git", [
+          "clone", "--bare", "--filter=blob:none",
+          `https://github.com/${repo}.git`, cacheDir,
+        ]);
+      } else {
+        // Fetch any commits added since last run (fast, incremental).
+        await execFileAsync("git", ["-C", cacheDir, "fetch", "--quiet"]).catch(() => {});
+      }
+      return cacheDir;
+    })());
+  }
+  return cacheInitLocks.get(repo)!;
+}
 
 async function setupRepo(task: SweTask): Promise<string> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zengram-bench-repo-"));
-  const repoUrl = `https://github.com/${task.repo}.git`;
-  await execFileAsync("git", ["clone", "--depth", "1000", repoUrl, tmpDir]);
+  const cacheDir = await ensureCache(task.repo);
+  const tmpDir   = fs.mkdtempSync(path.join(os.tmpdir(), "zengram-bench-repo-"));
+  // --local uses hardlinks from the cache: fast and disk-efficient.
+  await execFileAsync("git", ["clone", "--local", cacheDir, tmpDir]);
   execFileSync("git", ["-C", tmpDir, "checkout", task.base_commit], { stdio: "ignore" });
   return tmpDir;
 }
