@@ -26,6 +26,7 @@ export interface RunResult {
   completion_tokens: number;
   duration_ms: number;
   error?: string;       // set if status !== "completed"
+  session_id?: string;  // Zengram session ID (zengram variant only)
 }
 
 /** Scoring result from the Python scorer. */

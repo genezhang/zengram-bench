@@ -1,107 +1,84 @@
-# OpenCode Adapter — Wiring the bench harness to your OpenCode fork
+# OpenCode Adapter Wiring
 
-The harness invokes agents via a configurable shell command.
-Both `opencode` (baseline) and `opencode-zengram` (fork) must accept:
+This directory contains shell adapters that bridge the bench harness's
+`--problem-statement / --repo / --max-turns / --output-patch / --usage-json`
+interface to OpenCode's actual CLI.
+
+## How OpenCode is invoked
 
 ```
-<cmd> run \
-  --problem-statement @/path/to/problem.txt \
-  --repo /path/to/repo \
-  --max-turns 30 \
-  --output-patch /path/to/output.patch \
-  --usage-json /path/to/usage.json
+opencode run --format json --dir <repo> < problem.txt
 ```
 
-Exit code must be 0 on success. The command writes:
-- `output.patch` — unified diff of all changes made to the repo
-- `usage.json` — `{ "turns": N, "prompt_tokens": N, "completion_tokens": N }`
+- `--format json` — emits newline-delimited JSON events to stdout
+- `--dir <repo>` — `process.chdir()` to the cloned repo before the session starts
+- `< problem.txt` — problem statement piped via stdin (safe for large prompts)
+- No `--session` flag — lets OpenCode create a fresh session each run
 
----
+### Max steps
 
-## Option A — Add a `bench` subcommand to OpenCode (recommended)
+OpenCode doesn't accept `--max-turns` on the CLI.  Steps are injected via:
 
-Add a non-interactive `bench run` subcommand to both OpenCode variants that:
-1. Reads the problem statement from the file path after `@`
-2. Runs the agent against `--repo` in headless mode
-3. On finish, runs `git diff` to write `--output-patch`
-4. Writes token usage to `--usage-json`
-
-This is the cleanest approach. The fork already captures turn/token counts
-in Zengram — expose them here.
-
----
-
-## Option B — Wrapper scripts
-
-If you want to keep the OpenCode CLI unchanged, write a thin shell wrapper
-that adapts the harness interface to what OpenCode actually supports.
-
-Example `scripts/run-baseline.sh`:
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Parse harness flags
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    run) shift ;;
-    --problem-statement) PROBLEM="$2"; shift 2 ;;
-    --repo)              REPO="$2";    shift 2 ;;
-    --max-turns)         TURNS="$2";   shift 2 ;;
-    --output-patch)      PATCH="$2";   shift 2 ;;
-    --usage-json)        USAGE="$2";   shift 2 ;;
-    *) shift ;;
-  esac
-done
-
-# Strip leading @ from problem file path
-PROBLEM="${PROBLEM#@}"
-
-# Run vanilla OpenCode in headless mode (adjust flags to match actual CLI)
-opencode \
-  --no-tui \
-  --message "$(cat "$PROBLEM")" \
-  --cwd "$REPO" \
-  --max-turns "$TURNS"
-
-# Capture the diff
-git -C "$REPO" diff HEAD > "$PATCH"
-
-# Write usage (OpenCode may log this to stderr or a file — adapt as needed)
-echo '{"turns": 0, "prompt_tokens": 0, "completion_tokens": 0}' > "$USAGE"
+export OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"steps":30}}}'
 ```
 
-Set the harness to use this wrapper:
+`build` is the default primary agent.  `OPENCODE_CONFIG_CONTENT` is merged
+over any file-based config at startup (`Flag.OPENCODE_CONFIG_CONTENT`).
+
+## Token extraction
+
+With `--format json`, each `step_finish` event has:
+
+```json
+{
+  "type": "step_finish",
+  "sessionID": "...",
+  "timestamp": 1234567890,
+  "part": {
+    "type": "step-finish",
+    "reason": "stop",
+    "cost": 0.012,
+    "tokens": {
+      "input": 4321,
+      "output": 876,
+      "reasoning": 0,
+      "cache": { "read": 1200, "write": 0 }
+    }
+  }
+}
+```
+
+The adapters sum `part.tokens.input` → `prompt_tokens` and
+`part.tokens.output` → `completion_tokens` across all `step_finish` events.
+The count of `step_finish` events = `turns`.
+
+## Variants
+
+| Variant  | Binary env var          | Storage env var           |
+|----------|-------------------------|---------------------------|
+| baseline | `OPENCODE_BIN`          | `OPENCODE_STORAGE=sqlite` |
+| zengram  | `OPENCODE_ZENGRAM_BIN`  | (default — Zengram on)    |
+
+Both default to `opencode` if the env var is not set, so point them at
+different binaries if you have both installed:
+
 ```bash
-export OPENCODE_BASELINE_CMD=/path/to/zengram-bench/scripts/run-baseline.sh
-export OPENCODE_ZENGRAM_CMD=/path/to/zengram-bench/scripts/run-zengram.sh
+export OPENCODE_BIN=/usr/local/bin/opencode            # vanilla
+export OPENCODE_ZENGRAM_BIN=~/opencode/opencode        # fork build
+export OPENCODE_BASELINE_CMD=scripts/run-baseline.sh
+export OPENCODE_ZENGRAM_CMD=scripts/run-zengram.sh
+bench run --variants baseline,zengram --runs 3
 ```
 
----
+## Zengram session ID
 
-## Option C — Environment variable override per run
+The `run-zengram.sh` adapter writes an optional `session_id` field to the
+usage JSON:
 
-The harness reads `OPENCODE_BASELINE_CMD` and `OPENCODE_ZENGRAM_CMD` at
-startup, so you can also just point them at any executable that honours
-the interface — a Python script, a Docker entrypoint, anything.
-
----
-
-## Token usage extraction
-
-The `usage.json` file is the main gap. OpenCode itself gets token counts
-from the LLM response. For the fork, these are already stored in Zengram's
-`turn` table — add an export step at the end of the agent run:
-
-```typescript
-// In your fork's bench mode exit handler:
-const turns = await db.query(
-  'SELECT COUNT(*) as n, SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct FROM turn WHERE session_id = $1',
-  [sessionId]
-);
-fs.writeFileSync(usageJsonPath, JSON.stringify({
-  turns: turns[0].n,
-  prompt_tokens: turns[0].pt,
-  completion_tokens: turns[0].ct,
-}));
+```json
+{"turns":12,"prompt_tokens":45678,"completion_tokens":2345,"session_id":"01jq..."}
 ```
+
+This can be used for offline querying of the Zengram DB
+(`~/.local/share/opencode/zeta/`) via `@zengram/node`.

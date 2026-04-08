@@ -71,7 +71,12 @@ export async function runAgent(
       ? fs.readFileSync(patchFile, "utf8")
       : "";
     const usage = fs.existsSync(usageFile)
-      ? (JSON.parse(fs.readFileSync(usageFile, "utf8")) as { turns: number; prompt_tokens: number; completion_tokens: number })
+      ? (JSON.parse(fs.readFileSync(usageFile, "utf8")) as {
+          turns: number;
+          prompt_tokens: number;
+          completion_tokens: number;
+          session_id?: string;
+        })
       : { turns: 0, prompt_tokens: 0, completion_tokens: 0 };
 
     return {
@@ -85,6 +90,7 @@ export async function runAgent(
       prompt_tokens:     usage.prompt_tokens,
       completion_tokens: usage.completion_tokens,
       duration_ms,
+      ...(usage.session_id ? { session_id: usage.session_id } : {}),
     };
   } catch (err: unknown) {
     const duration_ms = Date.now() - start;
