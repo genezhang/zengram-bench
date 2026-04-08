@@ -6,8 +6,8 @@ For each run result JSON in --runs-dir:
   1. Clone the repo, check out base_commit
   2. Apply the patch (git apply)
   3. Install the project (pip install -e .)
-  4. Run fail_to_pass tests — they must ALL pass
-  5. Run pass_to_pass tests — they must ALL still pass
+  4. Run tests via pytest --json-report for reliable per-test pass/fail
+  5. resolved = all fail_to_pass pass AND all pass_to_pass still pass
   6. Write a ScoreResult JSON to --scores-dir
 
 Usage:
@@ -18,8 +18,6 @@ Usage:
 
 import argparse
 import json
-import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,27 +38,53 @@ def load_tasks(cache_path: Path) -> dict[str, dict]:
 
 
 def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]]:
-    """Run the given test node IDs with pytest. Returns (passed, failed)."""
+    """
+    Run the given pytest node IDs and return (passed, failed).
+
+    Uses pytest-json-report for structured per-test results — avoids the
+    brittleness of parsing pytest's stdout.
+    """
     if not test_ids:
         return [], []
 
-    result = subprocess.run(
-        ["python", "-m", "pytest", "--tb=no", "-q", "--no-header", *test_ids],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+    report_file = repo_dir / ".pytest_bench_report.json"
+    try:
+        subprocess.run(
+            [
+                "python", "-m", "pytest",
+                "--json-report",
+                f"--json-report-file={report_file}",
+                "--tb=no", "-q", "--no-header",
+                *test_ids,
+            ],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return [], test_ids   # treat timeout as all-failed
+
+    if not report_file.exists():
+        # pytest-json-report not installed or crashed before writing
+        return [], test_ids
+
+    try:
+        report = json.loads(report_file.read_text())
+    except json.JSONDecodeError:
+        return [], test_ids
+    finally:
+        report_file.unlink(missing_ok=True)
+
+    # Build a lookup from node ID → outcome
+    outcome: dict[str, str] = {}
+    for t in report.get("tests", []):
+        outcome[t["nodeid"]] = t["outcome"]   # "passed" | "failed" | "error" | "skipped"
 
     passed, failed = [], []
     for tid in test_ids:
-        # Crude heuristic: check if pytest output contains "PASSED" for this test.
-        # A proper implementation would use pytest's JSON report plugin.
-        short = tid.split("::")[-1]
-        if f"PASSED" in result.stdout and short in result.stdout:
-            passed.append(tid)
-        elif result.returncode == 0 and tid not in result.stdout:
-            # pytest didn't mention it failing → assume passed
+        result = outcome.get(tid, "missing")
+        if result == "passed":
             passed.append(tid)
         else:
             failed.append(tid)
@@ -69,10 +93,10 @@ def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]
 
 
 def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
-    task_id  = run["task_id"]
-    variant  = run["variant"]
-    run_idx  = run["run_index"]
-    patch    = run.get("patch", "")
+    task_id = run["task_id"]
+    variant = run["variant"]
+    run_idx = run["run_index"]
+    patch   = run.get("patch", "")
 
     out_path = scores_dir / f"{task_id}_{variant}_{run_idx}.json"
     if out_path.exists():
@@ -81,30 +105,42 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
 
     print(f"  scoring {task_id} {variant} #{run_idx} …", end=" ", flush=True)
 
+    def write(result: dict) -> dict:
+        out_path.write_text(json.dumps(result, indent=2))
+        return result
+
     if not patch.strip():
-        result = {
+        print("empty patch")
+        return write({
             "task_id": task_id, "variant": variant, "run_index": run_idx,
             "resolved": False,
             "fail_to_pass_passed": [], "fail_to_pass_failed": task["fail_to_pass"],
             "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
             "scorer_error": "empty patch",
-        }
-        out_path.write_text(json.dumps(result, indent=2))
-        print("empty patch")
-        return result
+        })
 
     with tempfile.TemporaryDirectory() as tmp:
         repo_dir = Path(tmp) / "repo"
 
         # Clone and checkout base commit.
-        subprocess.run(
+        clone = subprocess.run(
             ["git", "clone", "--depth", "1000",
              f"https://github.com/{task['repo']}.git", str(repo_dir)],
-            check=True, capture_output=True,
+            capture_output=True, text=True,
         )
+        if clone.returncode != 0:
+            print("clone failed")
+            return write({
+                "task_id": task_id, "variant": variant, "run_index": run_idx,
+                "resolved": False,
+                "fail_to_pass_passed": [], "fail_to_pass_failed": task["fail_to_pass"],
+                "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
+                "scorer_error": f"git clone failed: {clone.stderr.strip()}",
+            })
+
         subprocess.run(
             ["git", "-C", str(repo_dir), "checkout", task["base_commit"]],
-            check=True, capture_output=True,
+            capture_output=True, check=True,
         )
 
         # Apply patch.
@@ -115,37 +151,37 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
             capture_output=True, text=True,
         )
         if apply.returncode != 0:
-            result = {
+            print("patch apply failed")
+            return write({
                 "task_id": task_id, "variant": variant, "run_index": run_idx,
                 "resolved": False,
                 "fail_to_pass_passed": [], "fail_to_pass_failed": task["fail_to_pass"],
                 "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
                 "scorer_error": f"git apply failed: {apply.stderr.strip()}",
-            }
-            out_path.write_text(json.dumps(result, indent=2))
-            print(f"patch apply failed")
-            return result
+            })
 
-        # Install the project in editable mode.
+        # Install project dependencies.
         subprocess.run(
-            ["pip", "install", "-e", ".", "--quiet"],
+            ["pip", "install", "-e", ".", "--quiet", "--no-input"],
+            cwd=repo_dir, capture_output=True,
+        )
+        subprocess.run(
+            ["pip", "install", "pytest", "pytest-json-report", "--quiet", "--no-input"],
             cwd=repo_dir, capture_output=True,
         )
 
-        # Run tests.
+        # Run tests with structured reporting.
         ftp_passed, ftp_failed = run_tests(repo_dir, task["fail_to_pass"])
         ptp_passed, ptp_failed = run_tests(repo_dir, task["pass_to_pass"])
 
         resolved = len(ftp_failed) == 0 and len(ptp_failed) == 0
-        result = {
+        print("resolved ✓" if resolved else "not resolved ✗")
+        return write({
             "task_id": task_id, "variant": variant, "run_index": run_idx,
             "resolved": resolved,
             "fail_to_pass_passed": ftp_passed, "fail_to_pass_failed": ftp_failed,
             "pass_to_pass_passed": ptp_passed, "pass_to_pass_failed": ptp_failed,
-        }
-        out_path.write_text(json.dumps(result, indent=2))
-        print("resolved ✓" if resolved else "not resolved ✗")
-        return result
+        })
 
 
 def main():
@@ -179,7 +215,7 @@ def main():
             continue
         score_run(run, tasks[task_id], scores_dir)
 
-    # Print quick summary.
+    # Quick summary.
     score_files = list(scores_dir.glob("*.json"))
     scores = [json.loads(f.read_text()) for f in score_files]
     for variant in ("baseline", "zengram"):
@@ -189,7 +225,7 @@ def main():
         resolved = sum(1 for s in vs if s["resolved"])
         print(f"\n{variant}: {resolved}/{len(vs)} runs resolved ({100*resolved/len(vs):.1f}%)")
 
-    print(f"\nNext: bench report")
+    print("\nNext: bench report")
 
 
 if __name__ == "__main__":

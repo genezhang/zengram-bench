@@ -1,8 +1,9 @@
 node_modules/
 dist/
-results/runs/
-results/scores/
-tasks/cache/
+# Ignore result data but keep the placeholder dirs so they exist after clone
+results/runs/*.json
+results/scores/*.json
+tasks/cache/*.json
 __pycache__/
 *.pyc
 .env

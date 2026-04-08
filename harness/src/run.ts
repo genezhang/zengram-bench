@@ -5,6 +5,10 @@
  *   1. Clone the repo to a temp directory and check out base_commit
  *   2. Run the agent
  *   3. Write the RunResult JSON to results/runs/
+ *
+ * Tasks run with controlled concurrency (--concurrency N).
+ * Variant × rep pairs within a task always run serially to avoid
+ * git-checkout races in the same temp directory.
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -24,10 +28,10 @@ const RESULTS_DIR = path.join(ROOT, "results", "runs");
 export interface RunOptions {
   subsetFile?: string;
   variants: Variant[];
-  numRuns: number;        // repetitions per task × variant
-  taskFilter?: string[];  // if set, only run these task IDs
+  numRuns: number;
+  taskFilter?: string[];
   dryRun?: boolean;
-  concurrency?: number;   // tasks in parallel (default 1 for safety)
+  concurrency: number;
 }
 
 export async function runBenchmark(opts: RunOptions): Promise<void> {
@@ -38,45 +42,55 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
     ? allTasks.filter((t) => opts.taskFilter!.includes(t.task_id))
     : allTasks;
 
-  console.log(`Running ${tasks.length} tasks × ${opts.variants.length} variants × ${opts.numRuns} reps`);
-  console.log(`= ${tasks.length * opts.variants.length * opts.numRuns} total agent invocations\n`);
-
-  let completed = 0;
   const total = tasks.length * opts.variants.length * opts.numRuns;
+  console.log(`Running ${tasks.length} tasks × ${opts.variants.length} variants × ${opts.numRuns} reps`);
+  console.log(`= ${total} total agent invocations  (concurrency=${opts.concurrency})\n`);
 
-  for (const task of tasks) {
-    for (const variant of opts.variants) {
-      for (let runIdx = 0; runIdx < opts.numRuns; runIdx++) {
-        const label = `[${++completed}/${total}] ${task.task_id} ${variant} #${runIdx}`;
-
-        // Skip if result already exists.
-        const outPath = resultPath(task.task_id, variant, runIdx);
-        if (fs.existsSync(outPath)) {
-          console.log(`  ${label} — skipped (result exists)`);
-          continue;
-        }
-
-        if (opts.dryRun) {
-          console.log(`  ${label} — dry run`);
-          continue;
-        }
-
-        console.log(`  ${label} …`);
-        const repoDir = await setupRepo(task);
-        try {
-          const result = await runAgent(task, variant, runIdx, repoDir);
-          writeResult(result, outPath);
-          const icon = result.status === "completed" ? "✓" : "✗";
-          console.log(`  ${icon} ${label} — ${result.status} (${result.turns} turns, ${result.prompt_tokens + result.completion_tokens} tokens)`);
-        } finally {
-          fs.rmSync(repoDir, { recursive: true, force: true });
-        }
-      }
-    }
+  if (opts.dryRun) {
+    for (const task of tasks)
+      for (const variant of opts.variants)
+        for (let i = 0; i < opts.numRuns; i++)
+          console.log(`  [dry-run] ${task.task_id} ${variant} #${i}`);
+    return;
   }
 
+  // Each work item is one (task, variant, runIdx) triple.
+  type WorkItem = { task: SweTask; variant: Variant; runIdx: number; label: string };
+  const queue: WorkItem[] = [];
+  for (const task of tasks)
+    for (const variant of opts.variants)
+      for (let runIdx = 0; runIdx < opts.numRuns; runIdx++)
+        queue.push({ task, variant, runIdx, label: `${task.task_id} ${variant} #${runIdx}` });
+
+  let completed = 0;
+  const sem = new Semaphore(opts.concurrency);
+
+  await Promise.all(
+    queue.map(async ({ task, variant, runIdx, label }) => {
+      const outPath = resultPath(task.task_id, variant, runIdx);
+      if (fs.existsSync(outPath)) {
+        console.log(`  [${++completed}/${total}] ${label} — skipped (exists)`);
+        return;
+      }
+
+      await sem.acquire();
+      console.log(`  [${++completed}/${total}] ${label} …`);
+      const repoDir = await setupRepo(task);
+      try {
+        const result = await runAgent(task, variant, runIdx, repoDir);
+        writeResult(result, outPath);
+        const icon = result.status === "completed" ? "✓" : "✗";
+        const tokens = result.prompt_tokens + result.completion_tokens;
+        console.log(`  ${icon} ${label} — ${result.status} (${result.turns} turns, ${tokens} tok)`);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        sem.release();
+      }
+    }),
+  );
+
   console.log(`\nDone. Results written to ${RESULTS_DIR}`);
-  console.log(`Next: cd harness/scorer && python score.py --results ${RESULTS_DIR}`);
+  console.log(`Next: cd harness/scorer && python score.py`);
 }
 
 // ── Repo setup ────────────────────────────────────────────────────────────────
@@ -84,10 +98,8 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
 async function setupRepo(task: SweTask): Promise<string> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zengram-bench-repo-"));
   const repoUrl = `https://github.com/${task.repo}.git`;
-
   await execFileAsync("git", ["clone", "--depth", "1000", repoUrl, tmpDir]);
   execFileSync("git", ["-C", tmpDir, "checkout", task.base_commit], { stdio: "ignore" });
-
   return tmpDir;
 }
 
@@ -107,4 +119,32 @@ export function loadRunResults(): RunResult[] {
     .readdirSync(RESULTS_DIR)
     .filter((f) => f.endsWith(".json"))
     .map((f) => JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, f), "utf8")) as RunResult);
+}
+
+// ── Semaphore ─────────────────────────────────────────────────────────────────
+
+class Semaphore {
+  private count: number;
+  private queue: Array<() => void> = [];
+
+  constructor(limit: number) {
+    this.count = limit;
+  }
+
+  acquire(): Promise<void> {
+    if (this.count > 0) {
+      this.count--;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.queue.push(resolve));
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    } else {
+      this.count++;
+    }
+  }
 }

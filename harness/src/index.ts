@@ -37,12 +37,14 @@ program
   .option("--runs <n>", "repetitions per task×variant", "3")
   .option("--tasks <file>", "path to task-ID file", "../tasks/django_subset.txt")
   .option("--filter <ids>", "comma-separated task IDs to run (subset of --tasks)")
+  .option("--concurrency <n>", "number of tasks to run in parallel", "1")
   .option("--dry-run", "print what would run without invoking agents", false)
   .action(async (opts) => {
     const variants = (opts.variants as string)
       .split(",")
       .map((v) => v.trim()) as Variant[];
-    const numRuns = parseInt(opts.runs as string, 10);
+    const numRuns     = parseInt(opts.runs as string, 10);
+    const concurrency = parseInt(opts.concurrency as string, 10);
     const taskFilter = opts.filter
       ? (opts.filter as string).split(",").map((s: string) => s.trim())
       : undefined;
@@ -52,6 +54,7 @@ program
       variants,
       numRuns,
       taskFilter,
+      concurrency,
       dryRun: opts.dryRun as boolean,
     });
   });
