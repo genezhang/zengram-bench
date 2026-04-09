@@ -2,8 +2,9 @@
 """
 Download and cache the SWE-bench Verified task metadata for our django subset.
 
+Uses the HuggingFace datasets-server HTTP API — no extra Python packages needed.
+
 Usage:
-    pip install -r requirements.txt
     python setup_tasks.py
     python setup_tasks.py --verify      # check all subset task IDs exist
     python setup_tasks.py --subset ../../tasks/django_subset.txt
@@ -11,13 +12,18 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SUBSET = ROOT / "tasks" / "django_subset.txt"
 DEFAULT_CACHE  = ROOT / "tasks" / "cache" / "tasks.json"
+
+HF_API  = "https://datasets-server.huggingface.co/rows"
+DATASET = "princeton-nlp/SWE-bench_Verified"
+PAGE    = 100   # max rows per request
 
 
 def load_subset(subset_file: Path) -> list[str]:
@@ -25,30 +31,55 @@ def load_subset(subset_file: Path) -> list[str]:
     return [l.strip() for l in lines if l.strip() and not l.startswith("#")]
 
 
+def fetch_page(offset: int, limit: int) -> dict:
+    params = urllib.parse.urlencode({
+        "dataset": DATASET,
+        "config":  "default",
+        "split":   "test",
+        "offset":  offset,
+        "limit":   limit,
+    })
+    url = f"{HF_API}?{params}"
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        return json.loads(resp.read())
+
+
 def fetch_from_huggingface(task_ids: set[str]) -> list[dict]:
-    """Download matching tasks from princeton-nlp/SWE-bench_Verified."""
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print("ERROR: 'datasets' package not found. Run: pip install -r requirements.txt")
-        sys.exit(1)
+    """Paginate HuggingFace datasets-server to find matching tasks."""
+    print(f"Fetching from HuggingFace datasets-server…")
+    found: list[dict] = []
+    offset = 0
 
-    print("Loading princeton-nlp/SWE-bench_Verified from HuggingFace…")
-    ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
+    while True:
+        data = fetch_page(offset, PAGE)
+        rows = data.get("rows", [])
+        total = data.get("num_rows_total", 0)
 
-    found = []
-    for row in ds:
-        if row["instance_id"] in task_ids:
+        for entry in rows:
+            row = entry["row"]
+            if row["instance_id"] not in task_ids:
+                continue
             found.append({
-                "task_id":                    row["instance_id"],
-                "repo":                       row["repo"],
-                "base_commit":                row["base_commit"],
-                "problem_statement":          row["problem_statement"],
-                "hints_text":                 row.get("hints_text", ""),
-                "fail_to_pass":               json.loads(row["FAIL_TO_PASS"]),
-                "pass_to_pass":               json.loads(row["PASS_TO_PASS"]),
-                "environment_setup_commit":   row.get("environment_setup_commit", row["base_commit"]),
+                "task_id":                  row["instance_id"],
+                "repo":                     row["repo"],
+                "base_commit":              row["base_commit"],
+                "problem_statement":        row["problem_statement"],
+                "hints_text":               row.get("hints_text", ""),
+                "fail_to_pass":             json.loads(row["FAIL_TO_PASS"]),
+                "pass_to_pass":             json.loads(row["PASS_TO_PASS"]),
+                "environment_setup_commit": row.get("environment_setup_commit", row["base_commit"]),
             })
+
+        offset += len(rows)
+        print(f"  {offset}/{total} rows scanned, {len(found)} matched so far…")
+
+        if offset >= total or not rows:
+            break
+
+        if len(found) == len(task_ids):
+            print("  All target tasks found early — stopping.")
+            break
+
     return found
 
 
