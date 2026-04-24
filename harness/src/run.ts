@@ -33,7 +33,16 @@ export interface RunOptions {
   taskFilter?: string[];
   dryRun?: boolean;
   concurrency: number;
+  /**
+   * Multi-session mode: reps of the same (task, variant) share a persistent
+   * XDG_DATA_HOME so Zengram state accumulates across runs. Surfaces the
+   * compounding-value dimension of Zengram (B1 in zengram-elevation-plan.md);
+   * turn-count reduction in rep 2+ vs rep 0 is the thesis test.
+   */
+  multiSession?: boolean;
 }
+
+const MULTI_SESSION_ROOT = path.join(ROOT, "results", "multi-session-state");
 
 export async function runBenchmark(opts: RunOptions): Promise<void> {
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
@@ -55,36 +64,49 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
     return;
   }
 
-  // Each work item is one (task, variant, runIdx) triple.
-  type WorkItem = { task: SweTask; variant: Variant; runIdx: number; label: string };
-  const queue: WorkItem[] = [];
+  // Group work by (task, variant) so reps run serially within a group
+  // (Zengram state accumulates across reps in multi-session mode, and even
+  // in single-session mode same-group reps race on temp dirs otherwise).
+  type Group = { task: SweTask; variant: Variant; reps: number };
+  const groups: Group[] = [];
   for (const task of tasks)
     for (const variant of opts.variants)
-      for (let runIdx = 0; runIdx < opts.numRuns; runIdx++)
-        queue.push({ task, variant, runIdx, label: `${task.task_id} ${variant} #${runIdx}` });
+      groups.push({ task, variant, reps: opts.numRuns });
 
   let completed = 0;
   const sem = new Semaphore(opts.concurrency);
 
   await Promise.all(
-    queue.map(async ({ task, variant, runIdx, label }) => {
-      const outPath = resultPath(task.task_id, variant, runIdx);
-      if (fs.existsSync(outPath)) {
-        console.log(`  [${++completed}/${total}] ${label} — skipped (exists)`);
-        return;
-      }
-
+    groups.map(async ({ task, variant, reps }) => {
       await sem.acquire();
-      console.log(`  [${++completed}/${total}] ${label} …`);
-      const repoDir = await setupRepo(task);
+      const pinnedDataDir = opts.multiSession
+        ? ensureMultiSessionDir(task.task_id, variant)
+        : undefined;
+
       try {
-        const result = await runAgent(task, variant, runIdx, repoDir);
-        writeResult(result, outPath);
-        const icon = result.status === "completed" ? "✓" : "✗";
-        const tokens = result.prompt_tokens + result.completion_tokens;
-        console.log(`  ${icon} ${label} — ${result.status} (${result.turns} turns, ${tokens} tok)`);
+        for (let runIdx = 0; runIdx < reps; runIdx++) {
+          const label = `${task.task_id} ${variant} #${runIdx}`;
+          const outPath = resultPath(task.task_id, variant, runIdx);
+          if (fs.existsSync(outPath)) {
+            console.log(`  [${++completed}/${total}] ${label} — skipped (exists)`);
+            continue;
+          }
+
+          console.log(`  [${++completed}/${total}] ${label} …`);
+          const repoDir = await setupRepo(task);
+          try {
+            const result = await runAgent(task, variant, runIdx, repoDir, {
+              pinnedDataDir,
+            });
+            writeResult(result, outPath);
+            const icon = result.status === "completed" ? "✓" : "✗";
+            const tokens = result.prompt_tokens + result.completion_tokens;
+            console.log(`  ${icon} ${label} — ${result.status} (${result.turns} turns, ${tokens} tok)`);
+          } finally {
+            fs.rmSync(repoDir, { recursive: true, force: true });
+          }
+        }
       } finally {
-        fs.rmSync(repoDir, { recursive: true, force: true });
         sem.release();
       }
     }),
@@ -92,6 +114,19 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
 
   console.log(`\nDone. Results written to ${RESULTS_DIR}`);
   console.log(`Next: cd harness/scorer && python score.py`);
+}
+
+// ── Multi-session state ──────────────────────────────────────────────────────
+//
+// Each (task, variant) pair gets its own persistent dir so reps 2+ can read
+// Zengram knowledge/workspace state from rep 0's writes. Pinned dirs stick
+// around across harness invocations so you can keep adding reps; if you need
+// a fresh start, delete `results/multi-session-state/` and re-run.
+
+function ensureMultiSessionDir(taskId: string, variant: Variant): string {
+  const dir = path.join(MULTI_SESSION_ROOT, `${taskId}_${variant}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 // ── Repo setup (with shared clone cache) ─────────────────────────────────────
@@ -112,7 +147,7 @@ async function ensureCache(repo: string): Promise<string> {
         fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
         console.log(`    [cache] cloning ${repo} …`);
         await execFileAsync("git", [
-          "clone", "--bare", "--filter=blob:none",
+          "clone", "--bare",
           `https://github.com/${repo}.git`, cacheDir,
         ]);
       } else {
