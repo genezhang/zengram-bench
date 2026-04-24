@@ -32,7 +32,13 @@ done
   echo "ERROR: missing required flags" >&2; exit 1
 }
 
-OPENCODE_ZENGRAM_BIN="${OPENCODE_ZENGRAM_BIN:-opencode}"
+# Default to the local fork script, NOT the literal `opencode` binary on PATH.
+# The unqualified `opencode` on most dev boxes resolves to an installed
+# upstream release (e.g. ~/.opencode/bin/opencode from March), which silently
+# runs the *wrong* codebase — no Zengram, no plays — and the bench output
+# still looks plausible. Override OPENCODE_ZENGRAM_BIN only when pointing at
+# a hand-built fork binary elsewhere.
+OPENCODE_ZENGRAM_BIN="${OPENCODE_ZENGRAM_BIN:-$(dirname "$0")/opencode-fork.sh}"
 EVENTS_FILE=$(mktemp /tmp/opencode-zengram-events-XXXXXX.jsonl)
 
 # OPENCODE_PINNED_DATA_DIR — when set, reuse this XDG_DATA_HOME across runs
