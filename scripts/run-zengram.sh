@@ -11,7 +11,10 @@
 #     --usage-json /tmp/usage.json
 #
 # Environment:
-#   OPENCODE_ZENGRAM_BIN   path to zengram-fork binary (default: "opencode")
+#   OPENCODE_ZENGRAM_BIN   path to zengram-fork binary or wrapper script.
+#                          Default: sibling `opencode-fork.sh` (resolved via
+#                          BASH_SOURCE so symlinks/PATH-invocation work).
+#                          Validated to be executable; error on mismatch.
 set -euo pipefail
 
 PROBLEM="" REPO="" TURNS=30 PATCH="" USAGE=""
@@ -32,13 +35,28 @@ done
   echo "ERROR: missing required flags" >&2; exit 1
 }
 
-# Default to the local fork script, NOT the literal `opencode` binary on PATH.
+# Resolve the adapter's own directory via BASH_SOURCE so the default below
+# works when the script is invoked through a symlink, via PATH as
+# `opencode-zengram`, or with `dirname "$0"` returning `.`. `readlink -f`
+# canonicalises the path without relying on `$PWD` at call time.
+ADAPTER_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+
+# Default to the sibling fork wrapper — NOT the literal `opencode` on PATH.
 # The unqualified `opencode` on most dev boxes resolves to an installed
-# upstream release (e.g. ~/.opencode/bin/opencode from March), which silently
-# runs the *wrong* codebase — no Zengram, no plays — and the bench output
-# still looks plausible. Override OPENCODE_ZENGRAM_BIN only when pointing at
-# a hand-built fork binary elsewhere.
-OPENCODE_ZENGRAM_BIN="${OPENCODE_ZENGRAM_BIN:-$(dirname "$0")/opencode-fork.sh}"
+# upstream release (e.g. ~/.opencode/bin/opencode), which silently runs the
+# *wrong* codebase — no Zengram, no plays — while still producing
+# plausible-looking bench output. Override OPENCODE_ZENGRAM_BIN when
+# pointing at a hand-built fork binary elsewhere.
+OPENCODE_ZENGRAM_BIN="${OPENCODE_ZENGRAM_BIN:-$ADAPTER_DIR/opencode-fork.sh}"
+
+# Validate the target exists and is executable — a missing file here is the
+# kind of silent cross-contamination we're specifically trying to prevent.
+if [[ ! -x "$OPENCODE_ZENGRAM_BIN" ]]; then
+  echo "ERROR: OPENCODE_ZENGRAM_BIN is not an executable: $OPENCODE_ZENGRAM_BIN" >&2
+  echo "       Export OPENCODE_ZENGRAM_BIN to point at your fork binary or" >&2
+  echo "       make $ADAPTER_DIR/opencode-fork.sh executable." >&2
+  exit 1
+fi
 EVENTS_FILE=$(mktemp /tmp/opencode-zengram-events-XXXXXX.jsonl)
 
 # OPENCODE_PINNED_DATA_DIR — when set, reuse this XDG_DATA_HOME across runs
