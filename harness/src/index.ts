@@ -40,6 +40,11 @@ program
   .option("--concurrency <n>", "number of tasks to run in parallel", "1")
   .option("--dry-run", "print what would run without invoking agents", false)
   .option("--skip-disk-check", "skip the free-disk-space preflight check", false)
+  .option(
+    "--multi-session",
+    "persist Zengram state across reps of the same (task, variant) so runs 2+ can recall from run 1 — measures compounding value",
+    false,
+  )
   .action(async (opts) => {
     const variants = (opts.variants as string)
       .split(",")
@@ -61,6 +66,7 @@ program
       taskFilter,
       concurrency,
       dryRun: opts.dryRun as boolean,
+      multiSession: opts.multiSession as boolean,
     });
   });
 

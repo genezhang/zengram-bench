@@ -36,11 +36,21 @@ const AGENT_CMDS: Record<Variant, string> = {
 const DEFAULT_MAX_TURNS = Number(process.env["BENCH_MAX_TURNS"] ?? "30");
 const DEFAULT_TIMEOUT_MS = Number(process.env["BENCH_TIMEOUT_MS"] ?? String(20 * 60 * 1000));
 
+export interface RunAgentOptions {
+  /**
+   * If set, pin the adapter's XDG_DATA_HOME to this dir so Zengram state
+   * persists across reps. The adapter scripts recognise this via the env
+   * variable OPENCODE_PINNED_DATA_DIR (see scripts/run-zengram.sh).
+   */
+  pinnedDataDir?: string;
+}
+
 export async function runAgent(
   task: SweTask,
   variant: Variant,
   runIndex: number,
   repoDir: string,
+  agentOpts: RunAgentOptions = {},
 ): Promise<RunResult> {
   const cmd = AGENT_CMDS[variant];
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zengram-bench-"));
@@ -51,6 +61,13 @@ export async function runAgent(
 
   const timestamp = new Date().toISOString();
   const start = Date.now();
+
+  const childEnv = {
+    ...process.env,
+    ...(agentOpts.pinnedDataDir
+      ? { OPENCODE_PINNED_DATA_DIR: agentOpts.pinnedDataDir }
+      : {}),
+  };
 
   try {
     await execFileAsync(
@@ -63,7 +80,7 @@ export async function runAgent(
         "--output-patch",     patchFile,
         "--usage-json",       usageFile,
       ],
-      { timeout: DEFAULT_TIMEOUT_MS },
+      { timeout: DEFAULT_TIMEOUT_MS, env: childEnv },
     );
 
     const duration_ms = Date.now() - start;
