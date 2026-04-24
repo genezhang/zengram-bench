@@ -64,27 +64,48 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
     return;
   }
 
-  // Group work by (task, variant) so reps run serially within a group
-  // (Zengram state accumulates across reps in multi-session mode, and even
-  // in single-session mode same-group reps race on temp dirs otherwise).
-  type Group = { task: SweTask; variant: Variant; reps: number };
-  const groups: Group[] = [];
-  for (const task of tasks)
-    for (const variant of opts.variants)
-      groups.push({ task, variant, reps: opts.numRuns });
+  // Multi-session mode REQUIRES reps of the same (task, variant) to run
+  // serially — Zengram state accumulates rep-to-rep and concurrent writes
+  // would race. In single-session mode there's no such constraint: each rep
+  // uses its own temp dir, so we preserve the prior behavior of treating
+  // each rep as a separate work item bounded by `--concurrency`.
+  type WorkItem = {
+    task: SweTask;
+    variant: Variant;
+    reps: Array<{ runIdx: number }>; // always 1 in single-session, N in multi-session
+    pinnedDataDir: string | undefined;
+  };
+  const items: WorkItem[] = [];
+  for (const task of tasks) {
+    for (const variant of opts.variants) {
+      // Only the Zengram fork reads OPENCODE_PINNED_DATA_DIR; baseline runs
+      // ignore it, so there's no reason to allocate a dir on disk for them.
+      const pinnedDataDir =
+        opts.multiSession && variant === "zengram"
+          ? ensureMultiSessionDir(task.task_id, variant)
+          : undefined;
+      if (opts.multiSession && pinnedDataDir) {
+        items.push({
+          task,
+          variant,
+          reps: Array.from({ length: opts.numRuns }, (_, runIdx) => ({ runIdx })),
+          pinnedDataDir,
+        });
+      } else {
+        for (let runIdx = 0; runIdx < opts.numRuns; runIdx++)
+          items.push({ task, variant, reps: [{ runIdx }], pinnedDataDir: undefined });
+      }
+    }
+  }
 
   let completed = 0;
   const sem = new Semaphore(opts.concurrency);
 
   await Promise.all(
-    groups.map(async ({ task, variant, reps }) => {
+    items.map(async ({ task, variant, reps, pinnedDataDir }) => {
       await sem.acquire();
-      const pinnedDataDir = opts.multiSession
-        ? ensureMultiSessionDir(task.task_id, variant)
-        : undefined;
-
       try {
-        for (let runIdx = 0; runIdx < reps; runIdx++) {
+        for (const { runIdx } of reps) {
           const label = `${task.task_id} ${variant} #${runIdx}`;
           const outPath = resultPath(task.task_id, variant, runIdx);
           if (fs.existsSync(outPath)) {
@@ -123,8 +144,24 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
 // around across harness invocations so you can keep adding reps; if you need
 // a fresh start, delete `results/multi-session-state/` and re-run.
 
+/**
+ * Sanitize a value for use as a filesystem path segment. Task IDs are loaded
+ * from an external tasks.json, so they can in principle contain `..`,
+ * forward/back slashes, NUL bytes, etc. Replace anything outside
+ * `[A-Za-z0-9._-]` with `_` so the resulting segment can't escape the root
+ * or produce an invalid directory name.
+ */
+function toSafePathSlug(value: string): string {
+  const slug = value.replace(/[^A-Za-z0-9._-]/g, "_");
+  return slug.length > 0 ? slug : "_";
+}
+
 function ensureMultiSessionDir(taskId: string, variant: Variant): string {
-  const dir = path.join(MULTI_SESSION_ROOT, `${taskId}_${variant}`);
+  const dir = path.resolve(MULTI_SESSION_ROOT, `${toSafePathSlug(taskId)}_${toSafePathSlug(String(variant))}`);
+  const relative = path.relative(MULTI_SESSION_ROOT, dir);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Resolved multi-session dir escapes root: ${dir}`);
+  }
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

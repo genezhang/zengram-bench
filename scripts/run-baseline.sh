@@ -59,9 +59,30 @@ run_once() {
     }
 }
 
+# Whitespace-tolerant step_finish detection — substring grep for
+# `"type":"step_finish"` misses lines whose formatter emits spaces, causing
+# spurious 90 s retries.
+has_step_finish() {
+  python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        if evt.get("type") == "step_finish":
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
 run_once
 # If no step_finish events were produced, assume rate-limiting and retry once.
-if ! grep -q '"type":"step_finish"' "$EVENTS_FILE"; then
+if ! has_step_finish "$EVENTS_FILE"; then
   echo "[adapter] no step_finish events — waiting 90 s then retrying once" >&2
   sleep 90
   run_once
