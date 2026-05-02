@@ -17,6 +17,7 @@
 import { program } from "commander";
 import { runBenchmark } from "./run.js";
 import { buildReport, printReport } from "./report.js";
+import { buildAnalysis, printAnalysis, writeAnalysis } from "./analyze.js";
 import type { Variant } from "./types.js";
 
 program
@@ -119,6 +120,26 @@ program
       console.log(JSON.stringify(report, null, 2));
     } else {
       printReport(report);
+    }
+  });
+
+// ── bench analyze ─────────────────────────────────────────────────────────────
+
+program
+  .command("analyze")
+  .description("Tag tool calls with wasted-action classes and print aggregates")
+  .option("--format <fmt>", "stdout format: table (default) or json", "table")
+  .option("--no-write", "skip writing results/analysis.json")
+  .action((opts) => {
+    const a = buildAnalysis();
+    if (opts.write !== false) {
+      const out = writeAnalysis(a);
+      if (opts.format !== "json") console.log(`Wrote ${out}`);
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(a, null, 2));
+    } else {
+      printAnalysis(a);
     }
   });
 

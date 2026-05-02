@@ -13,7 +13,7 @@
 #   OPENCODE_BIN   path to opencode binary (default: "opencode")
 set -euo pipefail
 
-PROBLEM="" REPO="" TURNS=30 PATCH="" USAGE=""
+PROBLEM="" REPO="" TURNS=30 PATCH="" USAGE="" TRAJ=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -23,6 +23,7 @@ while [[ $# -gt 0 ]]; do
     --max-turns)         TURNS="$2";       shift 2 ;;
     --output-patch)      PATCH="$2";       shift 2 ;;
     --usage-json)        USAGE="$2";       shift 2 ;;
+    --trajectory-json)   TRAJ="$2";        shift 2 ;;
     *)                   shift ;;
   esac
 done
@@ -40,9 +41,28 @@ trap 'rm -f "$EVENTS_FILE"; rm -rf "$RUN_DATA_DIR"' EXIT
 
 # ── Inject max-steps into agent config via env var ───────────────────────────
 # OPENCODE_CONFIG_CONTENT is merged over file-based config at startup.
-# "build" is the default primary agent.
+# "build" is the default primary agent. Sampler env vars are validated
+# against a numeric regex before being concatenated into JSON — a
+# non-numeric value (e.g. "abc" or stray quotes) would otherwise produce
+# invalid JSON and break opencode's startup in a hard-to-diagnose way.
 export OPENCODE_CONFIG_CONTENT
-OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d}}}' "$TURNS")
+NUM_RE='^[0-9]+(\.[0-9]+)?$'
+require_numeric() {
+  local name="$1" val="$2"
+  if ! [[ "$val" =~ $NUM_RE ]]; then
+    echo "ERROR: $name must be numeric (got: '$val')" >&2; exit 1
+  fi
+}
+SAMPLER=""
+if [[ -n "${OPENCODE_BENCH_TOP_P:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TOP_P "$OPENCODE_BENCH_TOP_P"
+  SAMPLER+=$(printf ',"top_p":%s' "$OPENCODE_BENCH_TOP_P")
+fi
+if [[ -n "${OPENCODE_BENCH_TEMPERATURE:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TEMPERATURE "$OPENCODE_BENCH_TEMPERATURE"
+  SAMPLER+=$(printf ',"temperature":%s' "$OPENCODE_BENCH_TEMPERATURE")
+fi
+OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d%s}}}' "$TURNS" "$SAMPLER")
 
 # ── Run OpenCode (baseline = SQLite, no Zengram) ─────────────────────────────
 # Pipe problem statement via stdin — avoids shell-quoting issues for large prompts.
@@ -51,9 +71,14 @@ OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d}}}' "$TURNS")
 run_once() {
   : > "$EVENTS_FILE"
   rm -rf "$RUN_DATA_DIR" && mkdir -p "$RUN_DATA_DIR"
+  local model_args=()
+  if [[ -n "${OPENCODE_BENCH_MODEL:-}" ]]; then
+    model_args=(--model "$OPENCODE_BENCH_MODEL")
+  fi
   XDG_DATA_HOME="$RUN_DATA_DIR" OPENCODE_STORAGE=sqlite "$OPENCODE_BIN" run \
     --format json \
     --dir    "$REPO" \
+    "${model_args[@]}" \
     < "$PROBLEM" > "$EVENTS_FILE" 2>&1 || {
       echo "[adapter] opencode exited non-zero, capturing partial results" >&2
     }
@@ -91,15 +116,55 @@ fi
 # ── Capture diff ─────────────────────────────────────────────────────────────
 git -C "$REPO" diff HEAD > "$PATCH"
 
-# ── Extract token totals from step_finish events ─────────────────────────────
-# Each step_finish JSON line has: { type:"step_finish", part:{ tokens:{input,output,...} } }
-python3 - "$EVENTS_FILE" "$USAGE" <<'PY'
+# ── Extract token totals + trajectory from event stream ─────────────────────
+# step_finish: { type:"step_finish", part:{ tokens:{input,output,cache:{read}} } }
+# tool_use:    { type:"tool_use",    part:{ tool, callID, state:{ status, input,
+#                                                                output, time:{start,end} } } }
+python3 - "$EVENTS_FILE" "$USAGE" "${TRAJ:-}" <<'PY'
 import sys, json
 
-events_file, usage_file = sys.argv[1], sys.argv[2]
+events_file = sys.argv[1]
+usage_file  = sys.argv[2]
+traj_file   = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+
 turns = 0
 prompt_tok = 0
 completion_tok = 0
+cache_read_tok = 0
+turns_with_cache_hit = 0
+
+current_turn = 0          # incremented on each step_start; tool_use rows tag the in-flight turn
+tool_counts = {}
+records = []
+files = {}                # path -> {"reads": n, "edits": n}
+bash_commands = []
+
+def file_stat(path):
+    if path not in files:
+        files[path] = {"reads": 0, "edits": 0}
+    return files[path]
+
+def summarize(tool, inp):
+    if not isinstance(inp, dict):
+        return ""
+    fp = inp.get("filePath") or inp.get("path")
+    if tool in ("read", "edit", "write") and fp:
+        return f"path={fp}"
+    if tool == "bash":
+        cmd = (inp.get("command") or "")[:80]
+        return f"cmd={cmd}"
+    if tool == "grep":
+        pat = inp.get("pattern") or ""
+        where = inp.get("path") or inp.get("include") or ""
+        return f"pattern={pat} path={where}".strip()
+    if tool == "glob":
+        return f"pattern={inp.get('pattern') or ''}"
+    if tool == "codesearch":
+        return f"q={inp.get('query') or inp.get('q') or ''}"
+    if tool == "webfetch":
+        return f"url={inp.get('url') or ''}"
+    keys = ",".join(sorted(k for k in inp.keys() if not k.startswith('_')))[:80]
+    return f"keys={keys}"
 
 with open(events_file, "r", errors="replace") as f:
     for line in f:
@@ -110,12 +175,67 @@ with open(events_file, "r", errors="replace") as f:
             evt = json.loads(line)
         except Exception:
             continue
-        if evt.get("type") == "step_finish":
+        et = evt.get("type")
+        if et == "step_start":
+            current_turn += 1
+        elif et == "step_finish":
             turns += 1
             tok = (evt.get("part") or {}).get("tokens") or {}
             prompt_tok     += tok.get("input",  0)
             completion_tok += tok.get("output", 0)
+            cache = (tok.get("cache") or {})
+            cr = cache.get("read", 0)
+            cache_read_tok += cr
+            if cr > 0:
+                turns_with_cache_hit += 1
+        elif et == "tool_use":
+            part = evt.get("part") or {}
+            tool = part.get("tool") or "unknown"
+            state = part.get("state") or {}
+            status = state.get("status") or "unknown"
+            inp = state.get("input") or {}
+            t = state.get("time") or {}
+            dur = int((t.get("end") or 0) - (t.get("start") or 0)) if t.get("end") and t.get("start") else 0
+            out = state.get("output") or ""
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            records.append({
+                "turn": max(current_turn, 1),
+                "tool": tool,
+                "input_summary": summarize(tool, inp),
+                "status": status if status in ("completed", "error") else "completed",
+                "duration_ms": dur,
+                "output_chars": len(out) if isinstance(out, str) else 0,
+            })
+            if isinstance(inp, dict):
+                fp = inp.get("filePath") or inp.get("path")
+                if tool == "read" and fp:
+                    file_stat(fp)["reads"] += 1
+                elif tool in ("edit", "write") and fp:
+                    file_stat(fp)["edits"] += 1
+                elif tool == "bash":
+                    cmd = (inp.get("command") or "")[:80]
+                    if cmd:
+                        bash_commands.append(cmd)
 
 with open(usage_file, "w") as f:
-    json.dump({"turns": turns, "prompt_tokens": prompt_tok, "completion_tokens": completion_tok}, f)
+    json.dump({
+        "turns": turns,
+        "prompt_tokens": prompt_tok,
+        "completion_tokens": completion_tok,
+        "cache_read_tokens": cache_read_tok,
+        "turns_with_cache_hit": turns_with_cache_hit,
+    }, f)
+
+if traj_file:
+    files_touched = sorted(
+        ({"path": p, **stats} for p, stats in files.items()),
+        key=lambda r: -(r["reads"] + r["edits"]),
+    )
+    with open(traj_file, "w") as f:
+        json.dump({
+            "tool_counts": tool_counts,
+            "files_touched": files_touched,
+            "bash_commands": bash_commands,
+            "records": records,
+        }, f)
 PY

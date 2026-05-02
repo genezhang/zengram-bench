@@ -13,6 +13,31 @@ export interface SweTask {
 /** Which agent variant to run. */
 export type Variant = "baseline" | "zengram";
 
+/** One tool invocation captured from the run --format json event stream. */
+export interface ToolCallRecord {
+  turn: number;                              // step index in which the call ran (1-based)
+  tool: string;                              // "read" | "edit" | "bash" | "grep" | ...
+  input_summary: string;                     // tool-specific compact summary
+  status: "completed" | "error";
+  duration_ms: number;
+  output_chars: number;                      // size of tool output
+}
+
+/** Per-file activity within a run; useful for spotting redundant reads. */
+export interface FileTouchRecord {
+  path: string;
+  reads: number;
+  edits: number;
+}
+
+/** Per-run trajectory of tool calls, the basis for wasted-action analysis. */
+export interface Trajectory {
+  tool_counts: Record<string, number>;
+  files_touched: FileTouchRecord[];
+  bash_commands: string[];
+  records: ToolCallRecord[];
+}
+
 /** Raw output from one agent run against one task. */
 export interface RunResult {
   task_id: string;
@@ -24,9 +49,12 @@ export interface RunResult {
   turns: number;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_tokens: number;
+  turns_with_cache_hit: number;
   duration_ms: number;
   error?: string;       // set if status !== "completed"
   session_id?: string;  // Zengram session ID (zengram variant only)
+  trajectory?: Trajectory;  // present when adapter supports --trajectory-json
 }
 
 /** Scoring result from the Python scorer. */
