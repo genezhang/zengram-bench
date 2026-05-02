@@ -49,7 +49,12 @@ export async function runBenchmark(opts: RunOptions): Promise<void> {
 
   const allTasks = loadTasks(opts.subsetFile);
   const tasks = opts.taskFilter
-    ? allTasks.filter((t) => opts.taskFilter!.includes(t.task_id))
+    // When --filter is provided, preserve the FILTER list's order instead of
+    // the subset-file's. Lets us script ordered passes (e.g. shuffle round 1
+    // vs shuffle round 2) without rewriting the subset file each time.
+    ? opts.taskFilter
+        .map((id) => allTasks.find((t) => t.task_id === id))
+        .filter((t): t is SweTask => !!t)
     : allTasks;
 
   const total = tasks.length * opts.variants.length * opts.numRuns;
@@ -157,7 +162,15 @@ function toSafePathSlug(value: string): string {
 }
 
 function ensureMultiSessionDir(taskId: string, variant: Variant): string {
-  const dir = path.resolve(MULTI_SESSION_ROOT, `${toSafePathSlug(taskId)}_${toSafePathSlug(String(variant))}`);
+  // BENCH_SUITE_NAME, when set, collapses all tasks in this run into a single
+  // shared pinned dir per variant. That makes plays from task A recallable
+  // when task B starts — the only way to actually exercise cross-task
+  // recall, since per-task dirs isolate zengram state by construction.
+  // Empty/whitespace = unset (treat as per-task to keep the existing
+  // single-task multi-rep behavior).
+  const suite = process.env["BENCH_SUITE_NAME"]?.trim();
+  const slug = suite ? `_suite_${toSafePathSlug(suite)}` : `_${toSafePathSlug(taskId)}`;
+  const dir = path.resolve(MULTI_SESSION_ROOT, `${slug}_${toSafePathSlug(String(variant))}`);
   const relative = path.relative(MULTI_SESSION_ROOT, dir);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error(`Resolved multi-session dir escapes root: ${dir}`);
