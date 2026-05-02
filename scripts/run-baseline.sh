@@ -41,11 +41,27 @@ trap 'rm -f "$EVENTS_FILE"; rm -rf "$RUN_DATA_DIR"' EXIT
 
 # ── Inject max-steps into agent config via env var ───────────────────────────
 # OPENCODE_CONFIG_CONTENT is merged over file-based config at startup.
-# "build" is the default primary agent.
+# "build" is the default primary agent. Sampler env vars are validated
+# against a numeric regex before being concatenated into JSON — a
+# non-numeric value (e.g. "abc" or stray quotes) would otherwise produce
+# invalid JSON and break opencode's startup in a hard-to-diagnose way.
 export OPENCODE_CONFIG_CONTENT
+NUM_RE='^[0-9]+(\.[0-9]+)?$'
+require_numeric() {
+  local name="$1" val="$2"
+  if ! [[ "$val" =~ $NUM_RE ]]; then
+    echo "ERROR: $name must be numeric (got: '$val')" >&2; exit 1
+  fi
+}
 SAMPLER=""
-[[ -n "${OPENCODE_BENCH_TOP_P:-}"      ]] && SAMPLER+=$(printf ',"top_p":%s'      "$OPENCODE_BENCH_TOP_P")
-[[ -n "${OPENCODE_BENCH_TEMPERATURE:-}" ]] && SAMPLER+=$(printf ',"temperature":%s' "$OPENCODE_BENCH_TEMPERATURE")
+if [[ -n "${OPENCODE_BENCH_TOP_P:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TOP_P "$OPENCODE_BENCH_TOP_P"
+  SAMPLER+=$(printf ',"top_p":%s' "$OPENCODE_BENCH_TOP_P")
+fi
+if [[ -n "${OPENCODE_BENCH_TEMPERATURE:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TEMPERATURE "$OPENCODE_BENCH_TEMPERATURE"
+  SAMPLER+=$(printf ',"temperature":%s' "$OPENCODE_BENCH_TEMPERATURE")
+fi
 OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d%s}}}' "$TURNS" "$SAMPLER")
 
 # ── Run OpenCode (baseline = SQLite, no Zengram) ─────────────────────────────
@@ -190,15 +206,16 @@ with open(events_file, "r", errors="replace") as f:
                 "duration_ms": dur,
                 "output_chars": len(out) if isinstance(out, str) else 0,
             })
-            fp = inp.get("filePath") or inp.get("path") if isinstance(inp, dict) else None
-            if tool == "read" and fp:
-                file_stat(fp)["reads"] += 1
-            elif tool in ("edit", "write") and fp:
-                file_stat(fp)["edits"] += 1
-            elif tool == "bash" and isinstance(inp, dict):
-                cmd = (inp.get("command") or "")[:80]
-                if cmd:
-                    bash_commands.append(cmd)
+            if isinstance(inp, dict):
+                fp = inp.get("filePath") or inp.get("path")
+                if tool == "read" and fp:
+                    file_stat(fp)["reads"] += 1
+                elif tool in ("edit", "write") and fp:
+                    file_stat(fp)["edits"] += 1
+                elif tool == "bash":
+                    cmd = (inp.get("command") or "")[:80]
+                    if cmd:
+                        bash_commands.append(cmd)
 
 with open(usage_file, "w") as f:
     json.dump({

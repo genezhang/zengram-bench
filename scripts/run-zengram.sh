@@ -77,9 +77,25 @@ fi
 export OPENCODE_CONFIG_CONTENT
 # Optional sampler overrides (e.g. for local llama.cpp where opencode's default
 # top_p=1 hangs on small Qwen models). Falls back to opencode defaults if unset.
+# Values are validated against a numeric regex before concatenation — a
+# non-numeric value would otherwise produce invalid JSON and break opencode
+# startup in a hard-to-diagnose way.
+NUM_RE='^[0-9]+(\.[0-9]+)?$'
+require_numeric() {
+  local name="$1" val="$2"
+  if ! [[ "$val" =~ $NUM_RE ]]; then
+    echo "ERROR: $name must be numeric (got: '$val')" >&2; exit 1
+  fi
+}
 SAMPLER=""
-[[ -n "${OPENCODE_BENCH_TOP_P:-}"      ]] && SAMPLER+=$(printf ',"top_p":%s'      "$OPENCODE_BENCH_TOP_P")
-[[ -n "${OPENCODE_BENCH_TEMPERATURE:-}" ]] && SAMPLER+=$(printf ',"temperature":%s' "$OPENCODE_BENCH_TEMPERATURE")
+if [[ -n "${OPENCODE_BENCH_TOP_P:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TOP_P "$OPENCODE_BENCH_TOP_P"
+  SAMPLER+=$(printf ',"top_p":%s' "$OPENCODE_BENCH_TOP_P")
+fi
+if [[ -n "${OPENCODE_BENCH_TEMPERATURE:-}" ]]; then
+  require_numeric OPENCODE_BENCH_TEMPERATURE "$OPENCODE_BENCH_TEMPERATURE"
+  SAMPLER+=$(printf ',"temperature":%s' "$OPENCODE_BENCH_TEMPERATURE")
+fi
 OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d%s}}}' "$TURNS" "$SAMPLER")
 
 # ── Run OpenCode fork (Zengram storage enabled by default) ───────────────────
@@ -232,15 +248,16 @@ with open(events_file, "r", errors="replace") as f:
                 "duration_ms": dur,
                 "output_chars": len(out) if isinstance(out, str) else 0,
             })
-            fp = inp.get("filePath") or inp.get("path") if isinstance(inp, dict) else None
-            if tool == "read" and fp:
-                file_stat(fp)["reads"] += 1
-            elif tool in ("edit", "write") and fp:
-                file_stat(fp)["edits"] += 1
-            elif tool == "bash" and isinstance(inp, dict):
-                cmd = (inp.get("command") or "")[:80]
-                if cmd:
-                    bash_commands.append(cmd)
+            if isinstance(inp, dict):
+                fp = inp.get("filePath") or inp.get("path")
+                if tool == "read" and fp:
+                    file_stat(fp)["reads"] += 1
+                elif tool in ("edit", "write") and fp:
+                    file_stat(fp)["edits"] += 1
+                elif tool == "bash":
+                    cmd = (inp.get("command") or "")[:80]
+                    if cmd:
+                        bash_commands.append(cmd)
 
 out = {
     "turns": turns,
