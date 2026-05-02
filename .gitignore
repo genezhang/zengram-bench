@@ -4,6 +4,15 @@ dist/
 results/runs/*.json
 results/scores/*.json
 results/repo-cache/
+# Ad-hoc archive dirs operators move stale runs into between bench passes —
+# never the same shape twice, never source code, never useful in git.
+results/runs/_archive_*/
+results/runs-archive-*/
+results/runs_archive_*/
+# Multi-session pinned XDG_DATA_HOME dirs (zengram state across reps)
+results/multi-session-state/
+# `bench analyze` output — derived from runs+scores, regenerable
+results/analysis.json
 tasks/cache/*.json
 __pycache__/
 *.pyc
