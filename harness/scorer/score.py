@@ -158,7 +158,15 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
         # GitHub clone — older base_commits like dj-12713's 2020-era 003bb34b
         # are past the --depth 1000 cutoff and would fail to check out.
         cache_dir = REPO_CACHE / task["repo"].replace("/", "__")
-        if cache_dir.exists():
+        # Validate the cache actually has the commit before using it. A stale
+        # or partially-created bare clone would otherwise fail the checkout
+        # for every run on this repo with no fallback. `rev-parse --verify`
+        # exits non-zero when the commit isn't reachable.
+        cache_has_commit = cache_dir.exists() and subprocess.run(
+            ["git", "-C", str(cache_dir), "rev-parse", "--verify", f"{task['base_commit']}^{{commit}}"],
+            capture_output=True,
+        ).returncode == 0
+        if cache_has_commit:
             clone = subprocess.run(
                 ["git", "clone", "--local", str(cache_dir), str(repo_dir)],
                 capture_output=True, text=True,
@@ -196,11 +204,19 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
                 capture_output=True, text=True,
             )
             if tpa.returncode != 0:
-                # Don't bail — record the issue but continue scoring against the
-                # agent's patch alone. (Some test_patches conflict with the
-                # base_commit's tree; better to surface that than to silently
-                # mark resolved=false with no diagnostic.)
-                print(f"test_patch apply failed: {tpa.stderr.strip()[:80]}")
+                # Stop here — scoring against the unpatched test suite would
+                # produce an indistinguishable "not resolved" result and hide
+                # the infrastructure failure. Surface it in scorer_error
+                # instead so the operator can fix the underlying conflict
+                # (typically a stale base_commit or stale cached test_patch).
+                print("test_patch apply failed")
+                return write({
+                    "task_id": task_id, "variant": variant, "run_index": run_idx,
+                    "resolved": False,
+                    "fail_to_pass_passed": [], "fail_to_pass_failed": task["fail_to_pass"],
+                    "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
+                    "scorer_error": f"test_patch apply failed: {tpa.stderr.strip()}",
+                })
 
         # Apply agent patch.
         patch_file = Path(tmp) / "agent.patch"
@@ -219,19 +235,22 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
                 "scorer_error": f"git apply failed: {apply.stderr.strip()}",
             })
 
-        # Install project dependencies. --break-system-packages is required on
-        # Python 3.12+ where PEP 668 marks system Python as externally managed
-        # and pip refuses to install into it without that flag (or a venv).
-        # For an offline scoring tool this is the simpler choice; per-run venv
-        # would be cleaner but adds ~5 s/run overhead × 30 runs.
+        # Install the project under test. --break-system-packages is required
+        # on Python 3.12+ where PEP 668 marks system Python as externally
+        # managed and pip refuses without it (or a venv); per-run venv would
+        # be cleaner but adds ~5 s/run × 30 runs.
+        # Use `sys.executable -m pip` so the install lands in the same
+        # interpreter run_tests() will use — a bare `pip` on PATH may point
+        # at a different Python and the install would silently land elsewhere,
+        # making valid runs look unresolved on import errors.
         subprocess.run(
-            ["pip", "install", "-e", ".", "--quiet", "--no-input", "--break-system-packages"],
+            [sys.executable, "-m", "pip", "install", "-e", ".",
+             "--quiet", "--no-input", "--break-system-packages"],
             cwd=repo_dir, capture_output=True,
         )
-        subprocess.run(
-            ["pip", "install", "pytest", "pytest-json-report", "--quiet", "--no-input", "--break-system-packages"],
-            cwd=repo_dir, capture_output=True,
-        )
+        # No pytest install: run_tests() shells out to Django's tests/runtests.py,
+        # not pytest. The previous pytest+pytest-json-report install was dead
+        # weight after that switch.
 
         # Run tests with structured reporting.
         ftp_passed, ftp_failed = run_tests(repo_dir, task["fail_to_pass"])
