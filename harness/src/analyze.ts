@@ -157,7 +157,11 @@ function classifyRecords(records: ToolCallRecord[]): TaggedRecord[] {
     if (r.tool === "read") {
       const key = readDedupKey(r);
       if (seenReadKeys.has(key)) tag = "redundant_read";
-      else seenReadKeys.add(key);
+      // Only successful reads count as "seen". An errored read produced no
+      // output, so a later successful read of the same range isn't waste —
+      // it's the agent recovering. error_retry still catches the immediate-
+      // next-record retry case for both reads and other tools.
+      if (r.status === "completed") seenReadKeys.add(key);
     } else if (r.tool === "bash") {
       const cmd = r.input_summary.startsWith("cmd=") ? r.input_summary.slice(4) : r.input_summary;
       if (LINT_PATTERNS.some((p) => p.test(cmd))) tag = "lint_only";
