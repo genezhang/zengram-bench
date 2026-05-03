@@ -68,6 +68,13 @@ def fetch_from_huggingface(task_ids: set[str]) -> list[dict]:
                 "fail_to_pass":             json.loads(row["FAIL_TO_PASS"]),
                 "pass_to_pass":             json.loads(row["PASS_TO_PASS"]),
                 "environment_setup_commit": row.get("environment_setup_commit", row["base_commit"]),
+                # SWE-bench fail_to_pass tests are typically NEW tests added in
+                # the upstream PR, so the scorer must apply this `test_patch`
+                # before the agent's patch — otherwise the test doesn't exist
+                # in the file and runtests.py reports "no such test" and marks
+                # every run failed regardless of whether the agent's source fix
+                # was correct.
+                "test_patch":               row.get("test_patch", ""),
             })
 
         offset += len(rows)
