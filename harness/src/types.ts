@@ -21,6 +21,13 @@ export interface ToolCallRecord {
   status: "completed" | "error";
   duration_ms: number;
   output_chars: number;                      // size of tool output
+  /**
+   * Raw structured tool input. Present on trajectories produced by opencode's
+   * native --trajectory-json (since opencode#22). Older bench-produced
+   * trajectories don't carry this field; consumers should treat it as
+   * optional and fall back to `input_summary` when absent.
+   */
+  input?: Record<string, unknown>;
 }
 
 /** Per-file activity within a run; useful for spotting redundant reads. */

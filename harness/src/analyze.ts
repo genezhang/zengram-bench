@@ -33,7 +33,7 @@ const ANALYSIS_OUT = path.join(ROOT, "results", "analysis.json");
 /** Per-call waste tag. "useful" is the catch-all for non-flagged calls. */
 export type WasteTag =
   | "useful"
-  | "redundant_read"   // same file read 2+ times in this run (chunked reads conflated, see note)
+  | "redundant_read"   // literal re-read of same file+offset+limit (chunked re-reads of different ranges are NOT flagged when records carry `input`)
   | "premature_test"   // bash test runner ran before any edit/write landed
   | "lint_only"        // bash matched a formatter/linter, not a test
   | "error_retry";     // this call retried a same-tool same-input call that errored
@@ -110,8 +110,40 @@ const LINT_PATTERNS = [
 
 // ── Per-run classification ───────────────────────────────────────────────────
 
+/**
+ * Build the dedup key used by `redundant_read` and `error_retry` detection.
+ *
+ * When `input` is present (opencode#22+ trajectories), key on `path|offset|limit`
+ * for reads — distinguishes chunked re-reads of different ranges of the same
+ * file from literal re-reads of the same lines. Both are common in agent
+ * sessions and only the latter is genuine waste.
+ *
+ * Falls back to `input_summary` for older bench-produced trajectories that
+ * don't carry the structured `input` field.
+ */
+function readDedupKey(r: ToolCallRecord): string {
+  if (!r.input) return r.input_summary;
+  const fp = typeof r.input.filePath === "string"
+    ? r.input.filePath
+    : typeof r.input.path === "string"
+      ? r.input.path
+      : "";
+  if (!fp) return r.input_summary;
+  // offset/limit may be number, undefined, or null — coerce to a stable string
+  // so the key matches across "absent" and "explicitly default" forms.
+  const off = typeof r.input.offset === "number" ? String(r.input.offset) : "";
+  const lim = typeof r.input.limit === "number" ? String(r.input.limit) : "";
+  return `path=${fp}|off=${off}|lim=${lim}`;
+}
+
+function retryDedupKey(r: ToolCallRecord): string {
+  // For non-read tools fall back to input_summary; same-tool same-input is the
+  // signal we want for error_retry across all tools.
+  return r.tool === "read" ? readDedupKey(r) : r.input_summary;
+}
+
 function classifyRecords(records: ToolCallRecord[]): TaggedRecord[] {
-  const seenReadPaths = new Set<string>();
+  const seenReadKeys = new Set<string>();
   let firstEditIdx = records.findIndex(
     (r) => (r.tool === "edit" || r.tool === "write") && r.status === "completed",
   );
@@ -123,11 +155,9 @@ function classifyRecords(records: ToolCallRecord[]): TaggedRecord[] {
     let tag: WasteTag = "useful";
 
     if (r.tool === "read") {
-      // input_summary is `path=<file>`; group by exact summary so we don't
-      // need to re-parse. Chunked reads of the same file (different offsets)
-      // get conflated — flagged in the type doc above.
-      if (seenReadPaths.has(r.input_summary)) tag = "redundant_read";
-      else seenReadPaths.add(r.input_summary);
+      const key = readDedupKey(r);
+      if (seenReadKeys.has(key)) tag = "redundant_read";
+      else seenReadKeys.add(key);
     } else if (r.tool === "bash") {
       const cmd = r.input_summary.startsWith("cmd=") ? r.input_summary.slice(4) : r.input_summary;
       if (LINT_PATTERNS.some((p) => p.test(cmd))) tag = "lint_only";
@@ -135,10 +165,10 @@ function classifyRecords(records: ToolCallRecord[]): TaggedRecord[] {
     }
 
     // error_retry overrides the above: if the *previous* record errored on
-    // the same tool with same input_summary, this record is a retry.
+    // the same tool with the same input, this record is a retry.
     if (i > 0) {
       const prev = records[i - 1]!;
-      if (prev.status === "error" && prev.tool === r.tool && prev.input_summary === r.input_summary) {
+      if (prev.status === "error" && prev.tool === r.tool && retryDedupKey(prev) === retryDedupKey(r)) {
         tag = "error_retry";
       }
     }
