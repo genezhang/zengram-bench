@@ -104,6 +104,13 @@ OPENCODE_CONFIG_CONTENT=$(printf '{"agent":{"build":{"steps":%d%s}}}' "$TURNS" "
 # Retry once after 90 s if the run produces 0 step_finish events (rate limit).
 run_once() {
   : > "$EVENTS_FILE"
+  # Wipe any trajectory file from a prior attempt. run_once can be invoked
+  # twice (the 90 s retry below); if attempt #2 exits before opencode writes
+  # the trajectory, the harness would otherwise load attempt #1's stale
+  # trajectory — which won't match the final $EVENTS_FILE or $PATCH.
+  if [[ -n "${TRAJ:-}" ]]; then
+    rm -f "$TRAJ"
+  fi
   # Only wipe the data dir in single-session mode. Multi-session callers
   # (OPENCODE_PINNED_DATA_DIR set) depend on Zengram state persisting across
   # reps, so we must not nuke it between invocations.
