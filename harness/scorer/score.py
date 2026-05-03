@@ -18,15 +18,23 @@ Usage:
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-ROOT        = Path(__file__).resolve().parents[3]
+# score.py lives at <root>/harness/scorer/score.py — that's parents[2] from
+# the file. The previous parents[3] resolved one dir too far (e.g. /home/gene
+# instead of /home/gene/zengram-bench); harness CLI overrides masked the bug
+# for RUNS_DIR/SCORES_DIR/TASKS_CACHE but REPO_CACHE has no override so the
+# local-clone fast path silently never matched. Fixing the depth makes all
+# defaults resolve correctly.
+ROOT        = Path(__file__).resolve().parents[2]
 RUNS_DIR    = ROOT / "results" / "runs"
 SCORES_DIR  = ROOT / "results" / "scores"
 TASKS_CACHE = ROOT / "tasks" / "cache" / "tasks.json"
+REPO_CACHE  = ROOT / "results" / "repo-cache"
 
 
 def load_tasks(cache_path: Path) -> dict[str, dict]:
@@ -37,25 +45,41 @@ def load_tasks(cache_path: Path) -> dict[str, dict]:
     return {t["task_id"]: t for t in json.loads(cache_path.read_text())}
 
 
+_DJANGO_TEST_ID = re.compile(r'^(\S+)\s*\((.+)\)$')
+
+
+def _to_dotted(test_id: str) -> str:
+    """SWE-bench Django tests come in unittest's `method (mod.Class)` format,
+    but Django's runtests.py wants the dotted `mod.Class.method`."""
+    m = _DJANGO_TEST_ID.match(test_id)
+    return f"{m.group(2)}.{m.group(1)}" if m else test_id
+
+
 def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]]:
     """
-    Run the given pytest node IDs and return (passed, failed).
+    Run the given test IDs via Django's runtests.py and return (passed, failed).
 
-    Uses pytest-json-report for structured per-test results — avoids the
-    brittleness of parsing pytest's stdout.
+    Uses runtests.py (Django's own unittest-based runner) rather than pytest
+    because SWE-bench Django tasks ship test IDs in unittest's
+    `method (module.Class)` format, which pytest doesn't recognise. We
+    translate to dotted form and parse runtests.py's verbose output.
     """
     if not test_ids:
         return [], []
 
-    report_file = repo_dir / ".pytest_bench_report.json"
+    dotted = [_to_dotted(t) for t in test_ids]
     try:
-        subprocess.run(
+        result = subprocess.run(
             [
-                "python", "-m", "pytest",
-                "--json-report",
-                f"--json-report-file={report_file}",
-                "--tb=no", "-q", "--no-header",
-                *test_ids,
+                # sys.executable so we always invoke the same interpreter the
+                # scorer is running in — boxes with only `python3` on PATH
+                # (no `python` symlink) would otherwise FileNotFoundError.
+                # --parallel=1 disables Django's multiprocessing pool — needed
+                # on Python 3.12+ where older Django's RemoteTestResult lacks
+                # the addDuration method unittest now calls; the pool crashes
+                # before any test result is reported.
+                sys.executable, "tests/runtests.py", "--verbosity=2", "--noinput",
+                "--parallel=1", *dotted,
             ],
             cwd=repo_dir,
             capture_output=True,
@@ -65,21 +89,29 @@ def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]
     except subprocess.TimeoutExpired:
         return [], test_ids   # treat timeout as all-failed
 
-    if not report_file.exists():
-        # pytest-json-report not installed or crashed before writing
-        return [], test_ids
-
-    try:
-        report = json.loads(report_file.read_text())
-    except json.JSONDecodeError:
-        return [], test_ids
-    finally:
-        report_file.unlink(missing_ok=True)
-
-    # Build a lookup from node ID → outcome
+    # runtests --verbosity=2 prints lines like:
+    #   test_reversed (utils_tests.test_datastructures.OrderedSetTests.test_reversed) ... ok
+    #   test_X (mod.Class.test_X) ... FAIL
+    #   test_Y (mod.Class.test_Y) ... ERROR
+    # Parse stderr (where unittest writes verbose output) line-by-line.
     outcome: dict[str, str] = {}
-    for t in report.get("tests", []):
-        outcome[t["nodeid"]] = t["outcome"]   # "passed" | "failed" | "error" | "skipped"
+    for line in result.stderr.splitlines():
+        # Match the dotted path inside parens; strip a trailing `.method` so
+        # we recover the original `method (mod.Class)` form for lookup.
+        m = re.match(r'^\S+\s*\((\S+)\)\s*\.\.\.\s*(\w+)', line)
+        if not m:
+            continue
+        full = m.group(1)               # e.g. mod.Class.method
+        verdict = m.group(2).lower()    # ok | FAIL | ERROR | skipped
+        # Translate full back to the original `method (mod.Class)` form so
+        # the caller's test_ids list can match.
+        parts = full.rsplit(".", 1)
+        if len(parts) == 2:
+            mod_class, method = parts
+            display = f"{method} ({mod_class})"
+        else:
+            display = full
+        outcome[display] = "passed" if verdict == "ok" else "failed"
 
     passed, failed = [], []
     for tid in test_ids:
@@ -122,12 +154,29 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         repo_dir = Path(tmp) / "repo"
 
-        # Clone and checkout base commit.
-        clone = subprocess.run(
-            ["git", "clone", "--depth", "1000",
-             f"https://github.com/{task['repo']}.git", str(repo_dir)],
-            capture_output=True, text=True,
-        )
+        # Prefer the harness's bare-clone cache (full history) over a shallow
+        # GitHub clone — older base_commits like dj-12713's 2020-era 003bb34b
+        # are past the --depth 1000 cutoff and would fail to check out.
+        cache_dir = REPO_CACHE / task["repo"].replace("/", "__")
+        # Validate the cache actually has the commit before using it. A stale
+        # or partially-created bare clone would otherwise fail the checkout
+        # for every run on this repo with no fallback. `rev-parse --verify`
+        # exits non-zero when the commit isn't reachable.
+        cache_has_commit = cache_dir.exists() and subprocess.run(
+            ["git", "-C", str(cache_dir), "rev-parse", "--verify", f"{task['base_commit']}^{{commit}}"],
+            capture_output=True,
+        ).returncode == 0
+        if cache_has_commit:
+            clone = subprocess.run(
+                ["git", "clone", "--local", str(cache_dir), str(repo_dir)],
+                capture_output=True, text=True,
+            )
+        else:
+            clone = subprocess.run(
+                ["git", "clone", "--depth", "1000",
+                 f"https://github.com/{task['repo']}.git", str(repo_dir)],
+                capture_output=True, text=True,
+            )
         if clone.returncode != 0:
             print("clone failed")
             return write({
@@ -143,7 +192,33 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
             capture_output=True, check=True,
         )
 
-        # Apply patch.
+        # Apply test_patch first — SWE-bench fail_to_pass tests are typically
+        # NEW tests added in the upstream PR. Without this they don't exist
+        # in the test files and runtests.py reports "no such test", marking
+        # every run failed regardless of agent correctness.
+        if task.get("test_patch", "").strip():
+            tp_file = Path(tmp) / "test.patch"
+            tp_file.write_text(task["test_patch"])
+            tpa = subprocess.run(
+                ["git", "-C", str(repo_dir), "apply", "--whitespace=fix", str(tp_file)],
+                capture_output=True, text=True,
+            )
+            if tpa.returncode != 0:
+                # Stop here — scoring against the unpatched test suite would
+                # produce an indistinguishable "not resolved" result and hide
+                # the infrastructure failure. Surface it in scorer_error
+                # instead so the operator can fix the underlying conflict
+                # (typically a stale base_commit or stale cached test_patch).
+                print("test_patch apply failed")
+                return write({
+                    "task_id": task_id, "variant": variant, "run_index": run_idx,
+                    "resolved": False,
+                    "fail_to_pass_passed": [], "fail_to_pass_failed": task["fail_to_pass"],
+                    "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
+                    "scorer_error": f"test_patch apply failed: {tpa.stderr.strip()}",
+                })
+
+        # Apply agent patch.
         patch_file = Path(tmp) / "agent.patch"
         patch_file.write_text(patch)
         apply = subprocess.run(
@@ -160,15 +235,22 @@ def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
                 "scorer_error": f"git apply failed: {apply.stderr.strip()}",
             })
 
-        # Install project dependencies.
+        # Install the project under test. --break-system-packages is required
+        # on Python 3.12+ where PEP 668 marks system Python as externally
+        # managed and pip refuses without it (or a venv); per-run venv would
+        # be cleaner but adds ~5 s/run × 30 runs.
+        # Use `sys.executable -m pip` so the install lands in the same
+        # interpreter run_tests() will use — a bare `pip` on PATH may point
+        # at a different Python and the install would silently land elsewhere,
+        # making valid runs look unresolved on import errors.
         subprocess.run(
-            ["pip", "install", "-e", ".", "--quiet", "--no-input"],
+            [sys.executable, "-m", "pip", "install", "-e", ".",
+             "--quiet", "--no-input", "--break-system-packages"],
             cwd=repo_dir, capture_output=True,
         )
-        subprocess.run(
-            ["pip", "install", "pytest", "pytest-json-report", "--quiet", "--no-input"],
-            cwd=repo_dir, capture_output=True,
-        )
+        # No pytest install: run_tests() shells out to Django's tests/runtests.py,
+        # not pytest. The previous pytest+pytest-json-report install was dead
+        # weight after that switch.
 
         # Run tests with structured reporting.
         ftp_passed, ftp_failed = run_tests(repo_dir, task["fail_to_pass"])
