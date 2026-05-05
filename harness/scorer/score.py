@@ -140,15 +140,25 @@ def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False) -> d
 
     out_path = scores_dir / f"{task_id}_{variant}_{run_idx}.json"
     if out_path.exists() and not force:
+        # Distinguish three states so operators can diagnose:
+        #   1. corrupt / unreadable JSON → re-score, log the parse error
+        #   2. valid JSON but patch_hash mismatches → re-score (true staleness)
+        #   3. valid JSON with matching patch_hash → skip (cache hit)
         try:
             cached = json.loads(out_path.read_text())
-        except Exception:
+            cache_invalid = False
+            cache_error = None
+        except Exception as e:
             cached = {}
-        if cached.get("patch_hash") == patch_hash:
+            cache_invalid = True
+            cache_error = e
+        if cache_invalid:
+            print(f"  rescoring {task_id} {variant} #{run_idx} (cache file unreadable: {cache_error})")
+        elif cached.get("patch_hash") == patch_hash:
             print(f"  skip {task_id} {variant} #{run_idx} (score current for this patch)")
             return cached
-        # Score exists but was written for a different patch — treat as stale.
-        print(f"  rescoring {task_id} {variant} #{run_idx} (cached for old patch)")
+        else:
+            print(f"  rescoring {task_id} {variant} #{run_idx} (cached for old patch)")
 
     print(f"  scoring {task_id} {variant} #{run_idx} …", end=" ", flush=True)
 
