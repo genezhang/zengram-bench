@@ -17,7 +17,7 @@
 import { program } from "commander";
 import { runBenchmark } from "./run.js";
 import { buildReport, printReport } from "./report.js";
-import { buildAnalysis, printAnalysis, writeAnalysis } from "./analyze.js";
+import { buildAnalysisWithIntegrity, formatIntegrityReport, printAnalysis, writeAnalysis } from "./analyze.js";
 import type { Variant } from "./types.js";
 
 program
@@ -130,8 +130,26 @@ program
   .description("Tag tool calls with wasted-action classes and print aggregates")
   .option("--format <fmt>", "stdout format: table (default) or json", "table")
   .option("--no-write", "skip writing results/analysis.json")
+  .option("--allow-stale", "produce a report even if score integrity check fails (for debugging)")
   .action((opts) => {
-    const a = buildAnalysis();
+    const { analysis: a, integrity } = buildAnalysisWithIntegrity();
+    // Score-integrity gating: if any run lacks a fresh score, refuse to
+    // write analysis.json. This is the prevention layer for the round1–5
+    // caching artifact — the analyzer was happily aggregating stale data
+    // before because nothing checked. With this gate, fresh scoring is a
+    // precondition for an authoritative aggregate.
+    const integrityText = formatIntegrityReport(integrity);
+    if (integrity.issues.length === 0) {
+      if (opts.format !== "json") console.log(integrityText);
+    } else {
+      if (!opts.allowStale) {
+        console.error(integrityText);
+        console.error(`\nRefusing to write results/analysis.json with stale/missing scores.`);
+        process.exit(2);
+      }
+      console.error(integrityText);
+      console.error(`\n--allow-stale set: producing report anyway. DO NOT trust these numbers as authoritative.\n`);
+    }
     if (opts.write !== false) {
       const out = writeAnalysis(a);
       if (opts.format !== "json") console.log(`Wrote ${out}`);

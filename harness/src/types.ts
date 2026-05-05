@@ -75,6 +75,10 @@ export interface ScoreResult {
   pass_to_pass_passed: string[];
   pass_to_pass_failed: string[];
   scorer_error?: string;
+  // SHA-256(patch)[:16] of the patch this score reflects. Added by score.py
+  // since the patch-hash invalidation fix; legacy score files may lack it
+  // and are treated as stale by the analyzer's integrity check.
+  patch_hash?: string;
 }
 
 /** Aggregated stats for one variant over all tasks and repetitions. */
