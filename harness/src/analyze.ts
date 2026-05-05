@@ -14,6 +14,7 @@
  * heuristic to attack first.
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +79,29 @@ export interface Analysis {
   generated_at: string;
   per_run: RunAnalysis[];
   by_variant: Record<Variant, VariantAggregate>;
+}
+
+/** Per-run integrity classification for the score-vs-run pairing. */
+export type IntegrityStatus =
+  | "ok"             // score exists and patch_hash matches the run's patch
+  | "missing_score"  // run exists but no score file
+  | "no_hash"        // legacy score file (pre patch-hash field)
+  | "hash_mismatch"; // score is present but reflects a different patch
+
+export interface IntegrityIssue {
+  task_id: string;
+  variant: Variant;
+  run_index: number;
+  status: IntegrityStatus;
+  // Lower-cardinality summary for `details`: the actual hashes are noisy in
+  // logs but useful when triaging a single problem run.
+  expected_hash?: string;
+  cached_hash?: string;
+}
+
+export interface IntegrityReport {
+  ok_count: number;
+  issues: IntegrityIssue[];
 }
 
 // ── Heuristic patterns ───────────────────────────────────────────────────────
@@ -292,6 +316,62 @@ function aggregate(variant: Variant, runs: RunAnalysis[]): VariantAggregate {
 
 // ── Public entry points ──────────────────────────────────────────────────────
 
+/**
+ * SHA-256(patch)[:16] — must match score.py's hash_patch() exactly.
+ * Centralised so a future patch-hash format change is a one-line move.
+ */
+function hashPatch(patch: string): string {
+  return crypto.createHash("sha256").update(patch, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * Cross-check that every completed run has a score file whose patch_hash
+ * matches the run's current patch. Catches the bug class that triggered
+ * the round1–5 elevation-plan correction: stale scores silently reused
+ * across rounds because the scorer's skip-if-exists ignored patch identity.
+ *
+ * Returns issues so the analyzer can refuse to write analysis.json when
+ * the substrate is in a known-bad state (unless the operator passes
+ * --allow-stale to acknowledge they want to look at it anyway).
+ */
+export function checkIntegrity(
+  runs: RunResult[],
+  scoresByKey: Map<string, ScoreResult>,
+): IntegrityReport {
+  const issues: IntegrityIssue[] = [];
+  let ok = 0;
+  for (const run of runs) {
+    if (run.status !== "completed") continue;
+    const key = `${run.task_id}|${run.variant}|${run.run_index}`;
+    const score = scoresByKey.get(key);
+    const expected = hashPatch(run.patch ?? "");
+    if (!score) {
+      issues.push({
+        task_id: run.task_id, variant: run.variant, run_index: run.run_index,
+        status: "missing_score", expected_hash: expected,
+      });
+      continue;
+    }
+    if (!score.patch_hash) {
+      issues.push({
+        task_id: run.task_id, variant: run.variant, run_index: run.run_index,
+        status: "no_hash", expected_hash: expected,
+      });
+      continue;
+    }
+    if (score.patch_hash !== expected) {
+      issues.push({
+        task_id: run.task_id, variant: run.variant, run_index: run.run_index,
+        status: "hash_mismatch",
+        expected_hash: expected, cached_hash: score.patch_hash,
+      });
+      continue;
+    }
+    ok++;
+  }
+  return { ok_count: ok, issues };
+}
+
 export function buildAnalysis(): Analysis {
   const runs   = loadJsonDir<RunResult>(RUNS_DIR);
   const scores = loadJsonDir<ScoreResult>(SCORES_DIR);
@@ -314,6 +394,68 @@ export function buildAnalysis(): Analysis {
       zengram:  aggregate("zengram",  per_run),
     },
   };
+}
+
+/**
+ * Convenience entry point used by the CLI: load runs+scores, then return both
+ * the analysis and an integrity report so the caller can refuse to publish
+ * a stale aggregate.
+ */
+export function buildAnalysisWithIntegrity(): { analysis: Analysis; integrity: IntegrityReport } {
+  const runs   = loadJsonDir<RunResult>(RUNS_DIR);
+  const scores = loadJsonDir<ScoreResult>(SCORES_DIR);
+  const scoreKey = (s: { task_id: string; variant: string; run_index: number }) =>
+    `${s.task_id}|${s.variant}|${s.run_index}`;
+  const scoreByKey = new Map(scores.map((s) => [scoreKey(s), s]));
+  const integrity = checkIntegrity(runs, scoreByKey);
+
+  const per_run: RunAnalysis[] = [];
+  for (const run of runs) {
+    if (run.status !== "completed") continue;
+    const a = analyzeRun(run, scoreByKey.get(scoreKey(run)));
+    if (a) per_run.push(a);
+  }
+  const analysis: Analysis = {
+    generated_at: new Date().toISOString(),
+    per_run,
+    by_variant: {
+      baseline: aggregate("baseline", per_run),
+      zengram:  aggregate("zengram",  per_run),
+    },
+  };
+  return { analysis, integrity };
+}
+
+/** Format an IntegrityReport for human output. Empty when ok_count covers all. */
+export function formatIntegrityReport(report: IntegrityReport): string {
+  if (report.issues.length === 0) {
+    return `Score integrity: ok (${report.ok_count} runs ↔ scores)`;
+  }
+  const counts = report.issues.reduce<Record<IntegrityStatus, number>>(
+    (acc, i) => ({ ...acc, [i.status]: (acc[i.status] ?? 0) + 1 }),
+    { ok: 0, missing_score: 0, no_hash: 0, hash_mismatch: 0 },
+  );
+  const summary = [
+    `Score integrity: ${report.issues.length} issue(s) across ${report.ok_count + report.issues.length} runs`,
+    `  missing_score = ${counts.missing_score}  (run has no score file)`,
+    `  no_hash       = ${counts.no_hash}        (score predates patch-hash field — re-score)`,
+    `  hash_mismatch = ${counts.hash_mismatch}  (score reflects a different patch — re-score)`,
+  ];
+  // First few examples, prioritising hash_mismatch (most diagnostic).
+  const preview = [...report.issues]
+    .sort((a, b) => Number(a.status === "ok") - Number(b.status === "ok"))
+    .slice(0, 5);
+  for (const i of preview) {
+    summary.push(`    [${i.status}] ${i.task_id} ${i.variant} #${i.run_index}` +
+      (i.status === "hash_mismatch" ? `  expected=${i.expected_hash} cached=${i.cached_hash}` : ""));
+  }
+  if (report.issues.length > preview.length) {
+    summary.push(`    ... ${report.issues.length - preview.length} more`);
+  }
+  summary.push(``);
+  summary.push(`Run \`cd harness/scorer && python3 score.py\` to re-score.`);
+  summary.push(`Pass --allow-stale to bench analyze if you want to inspect anyway.`);
+  return summary.join("\n");
 }
 
 export function writeAnalysis(a: Analysis): string {
