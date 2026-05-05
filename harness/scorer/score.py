@@ -124,20 +124,48 @@ def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]
     return passed, failed
 
 
-def score_run(run: dict, task: dict, scores_dir: Path) -> dict:
+def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False) -> dict:
     task_id = run["task_id"]
     variant = run["variant"]
     run_idx = run["run_index"]
     patch   = run.get("patch", "")
+    # Hash the patch so we can detect when an existing score file was
+    # generated from a different patch (e.g. a prior bench round wrote the
+    # score, current round produced a different patch but shared task-id).
+    # Skipping by file existence alone caused rounds 2+ to silently reuse
+    # round 1's scores; the "low success rate" reported in the round 1-5
+    # elevation-plan analysis was largely this caching artifact.
+    import hashlib
+    patch_hash = hashlib.sha256(patch.encode("utf-8")).hexdigest()[:16]
 
     out_path = scores_dir / f"{task_id}_{variant}_{run_idx}.json"
-    if out_path.exists():
-        print(f"  skip {task_id} {variant} #{run_idx} (score exists)")
-        return json.loads(out_path.read_text())
+    if out_path.exists() and not force:
+        # Distinguish three states so operators can diagnose:
+        #   1. corrupt / unreadable JSON → re-score, log the parse error
+        #   2. valid JSON but patch_hash mismatches → re-score (true staleness)
+        #   3. valid JSON with matching patch_hash → skip (cache hit)
+        try:
+            cached = json.loads(out_path.read_text())
+            cache_invalid = False
+            cache_error = None
+        except Exception as e:
+            cached = {}
+            cache_invalid = True
+            cache_error = e
+        if cache_invalid:
+            print(f"  rescoring {task_id} {variant} #{run_idx} (cache file unreadable: {cache_error})")
+        elif cached.get("patch_hash") == patch_hash:
+            print(f"  skip {task_id} {variant} #{run_idx} (score current for this patch)")
+            return cached
+        else:
+            print(f"  rescoring {task_id} {variant} #{run_idx} (cached for old patch)")
 
     print(f"  scoring {task_id} {variant} #{run_idx} …", end=" ", flush=True)
 
     def write(result: dict) -> dict:
+        # Persist the patch hash so a future invocation can detect staleness
+        # without re-running the test suite.
+        result["patch_hash"] = patch_hash
         out_path.write_text(json.dumps(result, indent=2))
         return result
 
@@ -272,6 +300,8 @@ def main():
     parser.add_argument("--scores-dir",  default=str(SCORES_DIR))
     parser.add_argument("--tasks-cache", default=str(TASKS_CACHE))
     parser.add_argument("--task-id",     help="Score only this task ID")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-score even when score file exists with matching patch hash")
     args = parser.parse_args()
 
     runs_dir   = Path(args.runs_dir)
@@ -295,7 +325,7 @@ def main():
         if task_id not in tasks:
             print(f"  WARNING: task {task_id} not in cache, skipping")
             continue
-        score_run(run, tasks[task_id], scores_dir)
+        score_run(run, tasks[task_id], scores_dir, force=args.force)
 
     # Quick summary.
     score_files = list(scores_dir.glob("*.json"))
