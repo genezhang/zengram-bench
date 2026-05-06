@@ -132,12 +132,18 @@ Rules:
       ? (JSON.parse(fs.readFileSync(trajFile, "utf8")) as Trajectory)
       : undefined;
 
+    // A run that produced zero step_finish events is not "completed" no matter
+    // how cleanly the subprocess exited. The zengram adapter swallows
+    // opencode-fork's non-zero exit so the parent always sees status 0; without
+    // this gate, a wedged backend produces 0-turn 0-token results stamped
+    // "completed" — survey50_round7 (2026-05-06) lost 14 zengram runs this way.
+    const noSteps = usage.turns === 0;
     return {
       task_id:              task.task_id,
       variant,
       run_index:            runIndex,
       timestamp,
-      status:               "completed",
+      status:               noSteps ? "failed" : "completed",
       patch,
       turns:                usage.turns,
       prompt_tokens:        usage.prompt_tokens,
@@ -145,6 +151,7 @@ Rules:
       cache_read_tokens:    usage.cache_read_tokens ?? 0,
       turns_with_cache_hit: usage.turns_with_cache_hit ?? 0,
       duration_ms,
+      ...(noSteps ? { error: "agent produced no step_finish events (zero turns) — backend wedged or rate-limited past retry" } : {}),
       ...(usage.session_id ? { session_id: usage.session_id } : {}),
       ...(trajectory ? { trajectory } : {}),
     };
