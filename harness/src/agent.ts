@@ -32,11 +32,16 @@ import type { RunResult, SweTask, Trajectory, Variant } from "./types.js";
 // Run a child to completion, killing its entire process group on timeout.
 // `execFile`'s built-in timeout sends SIGTERM only to the immediate child,
 // which leaves grandchildren orphaned when the adapter is bash → exec bun
-// (round 9 dj-13033 wedged 8.5h past the 30-min cap this way). Putting the
-// child in its own process group via `detached: true` and SIGKILL'ing the
-// negative PID reaps every descendant regardless of how the wrapper handles
-// signals. The promise rejects with `Error("ETIMEDOUT")` so the existing
-// catch block in runAgent classifies the run as a timeout.
+// (a round 9 task wedged for hours past the configured timeout this way).
+// Putting the child in its own process group via `detached: true` and
+// SIGKILL'ing the negative PID reaps every descendant regardless of how
+// the wrapper handles signals. The promise rejects with `Error("ETIMEDOUT")`
+// so the existing catch block in runAgent classifies the run as a timeout.
+//
+// POSIX-only: `process.kill(-pid, ...)` is not supported on Windows. The
+// bench is Linux-only by design (llama.cpp / opencode-fork adapter chain),
+// but if that ever changes the negative-PID call will throw and we fall
+// back to a best-effort direct kill of the immediate child.
 function runWithTimeout(
   cmd: string,
   args: string[],
@@ -48,21 +53,38 @@ function runWithTimeout(
       detached: true,
       stdio:    "ignore",
     });
-    let timedOut = false;
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
     const timer = setTimeout(() => {
-      timedOut = true;
-      try { process.kill(-child.pid!, "SIGKILL"); } catch {}
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        // Negative-PID kill failed (e.g. Windows, or the group is already
+        // gone). Best-effort fallback to the immediate child — descendants
+        // may survive but at least the wrapper dies and the harness moves on.
+        try { child.kill("SIGKILL"); } catch {}
+      }
+      // Reject immediately rather than waiting for `exit`. If the SIGKILL
+      // doesn't take (unkillable state, permission error, non-POSIX platform
+      // where negative-PID isn't supported), waiting on `exit` would
+      // resurrect the wedge pathology this fix exists to prevent.
+      settle(() => reject(new Error("ETIMEDOUT")));
     }, opts.timeoutMs);
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
-      if (timedOut)        return reject(new Error("ETIMEDOUT"));
-      if (signal)          return reject(new Error(`killed by ${signal}`));
-      if (code !== 0)      return reject(new Error(`exited with code ${code}`));
-      resolve();
+      settle(() => {
+        if (signal)     return reject(new Error(`killed by ${signal}`));
+        if (code !== 0) return reject(new Error(`exited with code ${code}`));
+        resolve();
+      });
     });
     child.once("error", (err) => {
       clearTimeout(timer);
-      reject(err);
+      settle(() => reject(err));
     });
   });
 }
