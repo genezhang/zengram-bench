@@ -23,14 +23,71 @@
  *                       RunResult.trajectory to stay undefined)
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { RunResult, SweTask, Trajectory, Variant } from "./types.js";
 
-const execFileAsync = promisify(execFile);
+// Run a child to completion, killing its entire process group on timeout.
+// `execFile`'s built-in timeout sends SIGTERM only to the immediate child,
+// which leaves grandchildren orphaned when the adapter is bash → exec bun
+// (a round 9 task wedged for hours past the configured timeout this way).
+// Putting the child in its own process group via `detached: true` and
+// SIGKILL'ing the negative PID reaps every descendant regardless of how
+// the wrapper handles signals. The promise rejects with `Error("ETIMEDOUT")`
+// so the existing catch block in runAgent classifies the run as a timeout.
+//
+// POSIX-only: `process.kill(-pid, ...)` is not supported on Windows. The
+// bench is Linux-only by design (llama.cpp / opencode-fork adapter chain),
+// but if that ever changes the negative-PID call will throw and we fall
+// back to a best-effort direct kill of the immediate child.
+function runWithTimeout(
+  cmd: string,
+  args: string[],
+  opts: { timeoutMs: number; env: NodeJS.ProcessEnv },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      env:      opts.env,
+      detached: true,
+      stdio:    "ignore",
+    });
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        // Negative-PID kill failed (e.g. Windows, or the group is already
+        // gone). Best-effort fallback to the immediate child — descendants
+        // may survive but at least the wrapper dies and the harness moves on.
+        try { child.kill("SIGKILL"); } catch {}
+      }
+      // Reject immediately rather than waiting for `exit`. If the SIGKILL
+      // doesn't take (unkillable state, permission error, non-POSIX platform
+      // where negative-PID isn't supported), waiting on `exit` would
+      // resurrect the wedge pathology this fix exists to prevent.
+      settle(() => reject(new Error("ETIMEDOUT")));
+    }, opts.timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      settle(() => {
+        if (signal)     return reject(new Error(`killed by ${signal}`));
+        if (code !== 0) return reject(new Error(`exited with code ${code}`));
+        resolve();
+      });
+    });
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      settle(() => reject(err));
+    });
+  });
+}
 
 const AGENT_CMDS: Record<Variant, string> = {
   baseline: process.env["OPENCODE_BASELINE_CMD"] ?? "opencode",
@@ -97,7 +154,7 @@ Rules:
   };
 
   try {
-    await execFileAsync(
+    await runWithTimeout(
       cmd,
       [
         "run",
@@ -108,7 +165,7 @@ Rules:
         "--usage-json",       usageFile,
         "--trajectory-json",  trajFile,
       ],
-      { timeout: DEFAULT_TIMEOUT_MS, env: childEnv },
+      { timeoutMs: DEFAULT_TIMEOUT_MS, env: childEnv },
     );
 
     const duration_ms = Date.now() - start;
