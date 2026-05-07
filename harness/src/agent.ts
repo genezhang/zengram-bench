@@ -23,14 +23,49 @@
  *                       RunResult.trajectory to stay undefined)
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { RunResult, SweTask, Trajectory, Variant } from "./types.js";
 
-const execFileAsync = promisify(execFile);
+// Run a child to completion, killing its entire process group on timeout.
+// `execFile`'s built-in timeout sends SIGTERM only to the immediate child,
+// which leaves grandchildren orphaned when the adapter is bash → exec bun
+// (round 9 dj-13033 wedged 8.5h past the 30-min cap this way). Putting the
+// child in its own process group via `detached: true` and SIGKILL'ing the
+// negative PID reaps every descendant regardless of how the wrapper handles
+// signals. The promise rejects with `Error("ETIMEDOUT")` so the existing
+// catch block in runAgent classifies the run as a timeout.
+function runWithTimeout(
+  cmd: string,
+  args: string[],
+  opts: { timeoutMs: number; env: NodeJS.ProcessEnv },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      env:      opts.env,
+      detached: true,
+      stdio:    "ignore",
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid!, "SIGKILL"); } catch {}
+    }, opts.timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut)        return reject(new Error("ETIMEDOUT"));
+      if (signal)          return reject(new Error(`killed by ${signal}`));
+      if (code !== 0)      return reject(new Error(`exited with code ${code}`));
+      resolve();
+    });
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
 
 const AGENT_CMDS: Record<Variant, string> = {
   baseline: process.env["OPENCODE_BASELINE_CMD"] ?? "opencode",
@@ -97,7 +132,7 @@ Rules:
   };
 
   try {
-    await execFileAsync(
+    await runWithTimeout(
       cmd,
       [
         "run",
@@ -108,7 +143,7 @@ Rules:
         "--usage-json",       usageFile,
         "--trajectory-json",  trajFile,
       ],
-      { timeout: DEFAULT_TIMEOUT_MS, env: childEnv },
+      { timeoutMs: DEFAULT_TIMEOUT_MS, env: childEnv },
     );
 
     const duration_ms = Date.now() - start;
