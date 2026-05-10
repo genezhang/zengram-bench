@@ -97,6 +97,15 @@ const AGENT_CMDS: Record<Variant, string> = {
 const DEFAULT_MAX_TURNS = Number(process.env["BENCH_MAX_TURNS"] ?? "30");
 const DEFAULT_TIMEOUT_MS = Number(process.env["BENCH_TIMEOUT_MS"] ?? String(20 * 60 * 1000));
 
+// Gate `--trajectory-json` on OPENCODE_HAS_TRAJECTORY_JSON=1.
+// The flag was added by the old zengram fork and adopted by adapters in PR #8;
+// vanilla upstream OpenCode (and the v2 fork rebuilt directly off upstream/dev)
+// does not recognise it. When the flag is missing, opencode prints CLI help and
+// exits, producing zero step_finish events — which the harness then re-tries
+// after a 90 s sleep before giving up. Default OFF so a fresh setup runs against
+// upstream cleanly; export `1` once the trajectory feature lands in the fork.
+const HAS_TRAJECTORY_JSON = process.env["OPENCODE_HAS_TRAJECTORY_JSON"] === "1";
+
 export interface RunAgentOptions {
   /**
    * If set, pin the adapter's XDG_DATA_HOME to this dir so Zengram state
@@ -154,17 +163,20 @@ Rules:
   };
 
   try {
+    const args = [
+      "run",
+      "--problem-statement", `@${problemFile}`,
+      "--repo",             repoDir,
+      "--max-turns",        String(DEFAULT_MAX_TURNS),
+      "--output-patch",     patchFile,
+      "--usage-json",       usageFile,
+    ];
+    if (HAS_TRAJECTORY_JSON) {
+      args.push("--trajectory-json", trajFile);
+    }
     await runWithTimeout(
       cmd,
-      [
-        "run",
-        "--problem-statement", `@${problemFile}`,
-        "--repo",             repoDir,
-        "--max-turns",        String(DEFAULT_MAX_TURNS),
-        "--output-patch",     patchFile,
-        "--usage-json",       usageFile,
-        "--trajectory-json",  trajFile,
-      ],
+      args,
       { timeoutMs: DEFAULT_TIMEOUT_MS, env: childEnv },
     );
 
