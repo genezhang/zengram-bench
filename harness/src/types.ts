@@ -60,6 +60,10 @@ export interface RunResult {
   turns_with_cache_hit: number;
   duration_ms: number;
   error?: string;       // set if status !== "completed"
+  model?: string;       // provider/model the agent was asked to use (from OPENCODE_BENCH_MODEL).
+                        // Empty string if unset — that means opencode's recent-model auto-pick
+                        // selected the provider, which has historically caused silent drift
+                        // to opencode/qwen3.6-plus-free (2026-05-15 incident).
   session_id?: string;  // Zengram session ID (zengram variant only)
   trajectory?: Trajectory;  // present when adapter supports --trajectory-json
 }
