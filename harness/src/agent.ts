@@ -136,20 +136,54 @@ function recoverFromEvents(file: string): {
   try { text = fs.readFileSync(file, "utf8"); } catch { return empty; }
   let turns = 0, prompt = 0, completion = 0, cacheRead = 0, cacheHits = 0;
   let sessionId: string | undefined;
-  for (const line of text.split("\n")) {
+  // Pi emits `turn_end` once per complete turn with usage on message.usage.
+  // Counting these gives real turn data even from SIGKILL'd runs — the last
+  // complete turn before the kill is on disk; in-progress turns are absent.
+  // OpenCode emits `step_finish` instead — fall through to that if no
+  // turn_end events are found (heterogeneous result dirs).
+  let hasTurnEnd = false;
+  type Evt = {
+    type?: string;
+    id?: string; sessionID?: string;
+    // Pi turn_end
+    message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number } };
+    // OpenCode step_finish
+    part?: { tokens?: { input?: number; output?: number; cache?: { read?: number } } };
+  };
+  const lines = text.split("\n");
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    let evt: { type?: string; sessionID?: string; part?: { tokens?: { input?: number; output?: number; cache?: { read?: number } } } };
+    let evt: Evt;
     try { evt = JSON.parse(trimmed); } catch { continue; } // tail truncation OK
-    if (!sessionId && typeof evt.sessionID === "string") sessionId = evt.sessionID;
-    if (evt.type !== "step_finish") continue;
+    if (!sessionId) sessionId = evt.id ?? evt.sessionID;
+    if (evt.type !== "turn_end") continue;
+    hasTurnEnd = true;
     turns++;
-    const tok = evt.part?.tokens ?? {};
-    prompt     += tok.input  ?? 0;
-    completion += tok.output ?? 0;
-    const cr    = tok.cache?.read ?? 0;
+    const u = evt.message?.usage ?? {};
+    prompt     += u.input     ?? 0;
+    completion += u.output    ?? 0;
+    const cr    = u.cacheRead ?? 0;
     cacheRead  += cr;
     if (cr > 0) cacheHits++;
+  }
+  if (!hasTurnEnd) {
+    // OpenCode / legacy format: step_finish per turn.
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let evt: Evt;
+      try { evt = JSON.parse(trimmed); } catch { continue; }
+      if (!sessionId) sessionId = evt.id ?? evt.sessionID;
+      if (evt.type !== "step_finish") continue;
+      turns++;
+      const tok = evt.part?.tokens ?? {};
+      prompt     += tok.input  ?? 0;
+      completion += tok.output ?? 0;
+      const cr    = tok.cache?.read ?? 0;
+      cacheRead  += cr;
+      if (cr > 0) cacheHits++;
+    }
   }
   return {
     turns,
@@ -173,21 +207,29 @@ const SCRIPTS_DIR =
 const AGENT_CMDS: Record<Variant, string> =
   AGENT === "pi"
     ? {
-        baseline: process.env["PI_BASELINE_CMD"] ?? path.join(SCRIPTS_DIR, "run-pi-baseline.sh"),
-        zengram:  process.env["PI_ZENGRAM_CMD"]  ?? path.join(SCRIPTS_DIR, "run-pi-zengram.sh"),
+        baseline: process.env["PI_BASELINE_CMD"]  ?? path.join(SCRIPTS_DIR, "run-pi-baseline.sh"),
+        zengram:  process.env["PI_ZENGRAM_CMD"]   ?? path.join(SCRIPTS_DIR, "run-pi-zengram.sh"),
+        strategy: process.env["PI_STRATEGY_CMD"]  ?? path.join(SCRIPTS_DIR, "run-pi-strategy.sh"),
+        both:     process.env["PI_BOTH_CMD"]      ?? path.join(SCRIPTS_DIR, "run-pi-both.sh"),
       }
     : {
         baseline: process.env["OPENCODE_BASELINE_CMD"] ?? path.join(SCRIPTS_DIR, "run-baseline.sh"),
         zengram:  process.env["OPENCODE_ZENGRAM_CMD"]  ?? path.join(SCRIPTS_DIR, "run-zengram.sh"),
+        // strategy/both load the combined plugin entry (integrations/opencode/
+        // index.ts) with ZENGRAM_ARM gating; run-zengram.sh = memory-only arm.
+        strategy: process.env["OPENCODE_STRATEGY_CMD"] ?? path.join(SCRIPTS_DIR, "run-strategy.sh"),
+        both:     process.env["OPENCODE_BOTH_CMD"]     ?? path.join(SCRIPTS_DIR, "run-both.sh"),
       };
 
-// 100: most SWE tasks need well above the old 30 cap to resolve; a low cap
+// 250: most SWE tasks need well above the old 30 cap to resolve; a low cap
 // truncated long solves into failures for BOTH arms and flattened the
-// zengram-vs-vanilla delta. NOTE: raise BENCH_TIMEOUT_MS to match the LLM box's
-// throughput for the next run — at 20 min/task a high turn cap just trades
-// turn-truncation for wall-clock-truncation.
-const DEFAULT_MAX_TURNS = Number(process.env["BENCH_MAX_TURNS"] ?? "100");
-const DEFAULT_TIMEOUT_MS = Number(process.env["BENCH_TIMEOUT_MS"] ?? String(20 * 60 * 1000));
+// zengram-vs-vanilla delta. We deliberately let the model explore many paths
+// rather than capping it. COUPLED KNOB: BENCH_TIMEOUT_MS is raised to 60 min to
+// match — a high turn cap at the old 20 min/task just traded turn-truncation for
+// wall-clock-truncation. Both env-overridable; tune once the box's tokens/sec is
+// known (a wander turn on the local model is ~5s, so 250 turns ≈ 20+ min).
+const DEFAULT_MAX_TURNS = Number(process.env["BENCH_MAX_TURNS"] ?? "250");
+const DEFAULT_TIMEOUT_MS = Number(process.env["BENCH_TIMEOUT_MS"] ?? String(60 * 60 * 1000));
 
 // Gate `--trajectory-json` on OPENCODE_HAS_TRAJECTORY_JSON=1.
 // The flag was added by the old zengram fork and adopted by adapters in PR #8;
@@ -239,7 +281,7 @@ export async function runAgent(
   // pinned "## Project memory (durable lessons & facts)" block in the system
   // prompt and a `recall_memory` tool. (The old intrinsic <zengram-previously-
   // helpful> tag no longer exists under the plugin/extension architecture.)
-  const memoryRules = variant === "zengram"
+  const memoryRules = (variant === "zengram" || variant === "both")
     ? `7. You may see a "## Project memory (durable lessons & facts)" section in your system prompt, and you have a recall_memory tool. These carry lessons from PRIOR sessions on similar tasks — treat them as HINTS, not proof. If a hint names the likely file and change, use it as a shortcut: read that file ONCE for context, then call edit/write with the equivalent change. Do not re-discover the fix from scratch.
 8. CRITICAL: prior-session edits DO NOT exist in this checkout — every session starts from an unmodified clean checkout. A memory hint is never evidence the file is already fixed; you MUST still call edit/write yourself this session. Ending without an edit/write tool call is a failure regardless of what memory shows.
 `
@@ -270,6 +312,9 @@ ${memoryRules}9. KNOW WHEN TO QUIT. If after ~8 turns of exploration you cannot 
     // Adapter scripts honour this and emit opencode --format json into the
     // path we picked instead of an mktemp'd /tmp file — see eventsFile above.
     OPENCODE_EVENTS_FILE: eventsFile,
+    // Expose fail_to_pass test IDs to the test-runner extension loaded inside
+    // pi. The extension no-ops when this is absent so it's safe for all arms.
+    BENCH_FAIL_TO_PASS: JSON.stringify(task.fail_to_pass),
     ...(agentOpts.pinnedDataDir
       ? { OPENCODE_PINNED_DATA_DIR: agentOpts.pinnedDataDir }
       : {}),

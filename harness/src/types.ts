@@ -8,10 +8,17 @@ export interface SweTask {
   fail_to_pass: string[];   // tests that must newly pass
   pass_to_pass: string[];   // tests that must continue to pass
   environment_setup_commit: string;
+  test_patch?: string;      // unified diff that adds/modifies test cases for FTP tests
 }
 
-/** Which agent variant to run. */
-export type Variant = "baseline" | "zengram";
+/**
+ * Which agent variant to run.
+ *   baseline  — vanilla agent, no extensions
+ *   zengram   — code-level memory (zengram-memory.ts)
+ *   strategy  — phase guide + outcome storage (zengram-strategy.ts)
+ *   both      — memory + strategy together (zengram-memory.ts + zengram-strategy.ts)
+ */
+export type Variant = "baseline" | "zengram" | "strategy" | "both";
 
 /** One tool invocation captured from the run --format json event stream. */
 export interface ToolCallRecord {

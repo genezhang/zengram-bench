@@ -50,11 +50,14 @@ ADAPTER_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 # bench repo (…/zengram next to …/zengram-bench). Must be absolute — opencode
 # resolves plugin specs from OPENCODE_CONFIG_CONTENT with no config-file base
 # dir, so a relative path would not resolve.
-ZENGRAM_PLUGIN_PATH="${ZENGRAM_PLUGIN_PATH:-$ADAPTER_DIR/../../zengram/integrations/opencode/zengram-memory.ts}"
+# Point at the combined entry (index.ts). OpenCode resolves a file-plugin spec
+# to the containing dir's package.json `main` anyway (which is index.ts), but
+# naming it explicitly is clearer and robust to `main` changes.
+ZENGRAM_PLUGIN_PATH="${ZENGRAM_PLUGIN_PATH:-$ADAPTER_DIR/../../zengram/integrations/opencode/index.ts}"
 ZENGRAM_PLUGIN_PATH="$(readlink -f -- "$ZENGRAM_PLUGIN_PATH" 2>/dev/null || echo "$ZENGRAM_PLUGIN_PATH")"
 if [[ ! -f "$ZENGRAM_PLUGIN_PATH" ]]; then
   echo "ERROR: zengram plugin not found at $ZENGRAM_PLUGIN_PATH" >&2
-  echo "       Set ZENGRAM_PLUGIN_PATH to integrations/opencode/zengram-memory.ts." >&2
+  echo "       Set ZENGRAM_PLUGIN_PATH to integrations/opencode/index.ts." >&2
   exit 1
 fi
 # Plugin deps (@zengram/sdk + @zengram/node) must be installed next to it.
@@ -65,6 +68,27 @@ fi
 # Local embedding model — the plugin probes SELECT embed(); without a model it
 # degrades to importance-ordered recall and skips writes (pin/tool still work).
 export ZENGRAM_EMBED_MODEL_DIR="${ZENGRAM_EMBED_MODEL_DIR:-$HOME/embed}"
+
+# ── Arm selection ─────────────────────────────────────────────────────────────
+# The combined plugin entry (integrations/opencode/index.ts) exposes BOTH the
+# memory and strategy plugins and gates each on an env var. ZENGRAM_ARM picks
+# which activate; the run-strategy.sh / run-both.sh wrappers set it. Default
+# "memory" preserves this script's historical meaning (the zengram arm = memory
+# only), which matters now that the package `main` loads both plugins by default
+# — without this gate the zengram arm would silently become "both".
+#   memory   → recall/pin only          (strategy off)
+#   strategy → phase guide + gotchas     (memory off)
+#   both     → memory + strategy
+# Set BOTH gate vars explicitly in every branch (not just the "off" one) so an
+# inherited ZENGRAM_MEMORY/ZENGRAM_STRATEGY from the launching environment can't
+# silently zero out an arm — e.g. a leaked ZENGRAM_MEMORY=0 would otherwise turn
+# the default memory arm into "nothing loads".
+case "${ZENGRAM_ARM:-memory}" in
+  memory)   export ZENGRAM_MEMORY=1 ZENGRAM_STRATEGY=0 ;;
+  strategy) export ZENGRAM_MEMORY=0 ZENGRAM_STRATEGY=1 ;;
+  both)     export ZENGRAM_MEMORY=1 ZENGRAM_STRATEGY=1 ;;
+  *) echo "ERROR: unknown ZENGRAM_ARM='${ZENGRAM_ARM}' (want memory|strategy|both)" >&2; exit 1 ;;
+esac
 
 EVENTS_FILE="${OPENCODE_EVENTS_FILE:-$(mktemp /tmp/opencode-zengram-events-XXXXXX.jsonl)}"
 

@@ -1,0 +1,19 @@
+# Pilot-2 task set — 6 tasks selected 2026-06-16
+# Criteria: SWE-bench_Verified django, "15 min - 1 hour" difficulty,
+# 1-2 files changed, 20-55 lines in gold patch, ftp >= 2 (except 13513/11728).
+# All new (not in django_50.txt).
+#
+# task_id                        files  lines  ftp  notes
+# django__django-11728               1     22    2  admindocs regex trailing-group bug
+# django__django-13346               1     25    2  JSON __in lookup on MySQL/Oracle/SQLite
+# django__django-14170               2     38    2  iso_year breaks year lookup (2 files)
+# django__django-10973               1     37    5  postgres client -> subprocess.run+PGPASSWORD
+# django__django-13513               1     44    1  debug view ignores exc.__suppress_context__
+# django__django-16256               2     55    9  acreate/aget_or_create broken on related managers
+
+django__django-11728
+django__django-13346
+django__django-14170
+django__django-10973
+django__django-13513
+django__django-16256

@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
-# Adapter: Pi (genezhang/pi) + the zengram memory EXTENSION. Zengram arm for
-# BENCH_AGENT=pi. Same flag contract as the other adapters.
+# Adapter: Pi + zengram-strategy extension only (phase guide + outcome storage).
+# "strategy" arm for BENCH_AGENT=pi.
 #
-# Pi has no native --max-turns flag; we enforce the limit by watching the events
-# JSONL for turn_start events and killing pi when the count reaches TURNS (passed
-# via --max-turns, defaulting to 100). The zengram extension is loaded explicitly
-# with -e (under --no-extensions, so ONLY it loads — no other discovered extensions).
+# Loads ONLY zengram-strategy.ts (no code-level memory). Tests whether the
+# structured SWE-bench phase prompt (explore→reproduce→fix→verify) and
+# memory-driven strategy hints improve resolve rate over vanilla baseline.
 #
-# Usage (harness sets PI_ZENGRAM_CMD to this):
-#   ./run-pi-zengram.sh run --problem-statement @/tmp/p.txt --repo /tmp/repo \
-#     --max-turns 100 --output-patch /tmp/out.patch --usage-json /tmp/usage.json
+# Same flag contract as the other Pi adapters.
 #
 # Environment:
 #   PI_BIN                    pi binary/wrapper (default: "pi")
-#   ZENGRAM_PI_EXT            abs path to integrations/pi/zengram-memory.ts
-#                             (default: sibling ../../zengram/... of this repo)
+#   ZENGRAM_PI_STRATEGY_EXT   abs path to integrations/pi/zengram-strategy.ts
 #   ZENGRAM_EMBED_MODEL_DIR   local ONNX embed model dir (default: ~/embed)
-#   OPENCODE_PINNED_DATA_DIR  if set, persist zengram memory across reps here
-#                             (multi-session / compounding); else fresh per run
+#   OPENCODE_PINNED_DATA_DIR  if set, persist strategy memory across reps;
+#                             else fresh ZENGRAM_DATA_DIR per run
 #   PI_BENCH_MODEL / _PROVIDER / _API_KEY   model wiring
 set -euo pipefail
 
@@ -51,16 +47,15 @@ PI_BENCH_APPEND_PROMPT="${PI_BENCH_APPEND_PROMPT-Work the issue end to end: loca
 
 ADAPTER_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 
-# Resolve the Pi extension entry (sibling zengram checkout by default).
-ZENGRAM_PI_EXT="${ZENGRAM_PI_EXT:-$ADAPTER_DIR/../../zengram/integrations/pi/zengram-memory.ts}"
-ZENGRAM_PI_EXT="$(readlink -f -- "$ZENGRAM_PI_EXT" 2>/dev/null || echo "$ZENGRAM_PI_EXT")"
-if [[ ! -f "$ZENGRAM_PI_EXT" ]]; then
-  echo "ERROR: zengram Pi extension not found at $ZENGRAM_PI_EXT" >&2
-  echo "       Set ZENGRAM_PI_EXT to integrations/pi/zengram-memory.ts." >&2
+ZENGRAM_PI_STRATEGY_EXT="${ZENGRAM_PI_STRATEGY_EXT:-$ADAPTER_DIR/../../zengram/integrations/pi/zengram-strategy.ts}"
+ZENGRAM_PI_STRATEGY_EXT="$(readlink -f -- "$ZENGRAM_PI_STRATEGY_EXT" 2>/dev/null || echo "$ZENGRAM_PI_STRATEGY_EXT")"
+if [[ ! -f "$ZENGRAM_PI_STRATEGY_EXT" ]]; then
+  echo "ERROR: zengram strategy extension not found at $ZENGRAM_PI_STRATEGY_EXT" >&2
+  echo "       Set ZENGRAM_PI_STRATEGY_EXT to integrations/pi/zengram-strategy.ts." >&2
   exit 1
 fi
-if [[ ! -d "$(dirname "$ZENGRAM_PI_EXT")/node_modules/@zengram" ]]; then
-  echo "WARN: $(dirname "$ZENGRAM_PI_EXT")/node_modules/@zengram missing — run 'bun install' in the extension dir" >&2
+if [[ ! -d "$(dirname "$ZENGRAM_PI_STRATEGY_EXT")/node_modules/@zengram" ]]; then
+  echo "WARN: $(dirname "$ZENGRAM_PI_STRATEGY_EXT")/node_modules/@zengram missing — run 'bun install'" >&2
 fi
 
 export ZENGRAM_EMBED_MODEL_DIR="${ZENGRAM_EMBED_MODEL_DIR:-$HOME/embed}"
@@ -82,14 +77,14 @@ else
   echo "WARN: test-runner extension not found at $TEST_RUNNER_EXT — running without it" >&2
 fi
 
-# zengram memory dir: persist across reps when pinned (compounding), else fresh.
+# Strategy memory: persist across reps when pinned, else fresh per run.
 if [[ -n "${OPENCODE_PINNED_DATA_DIR:-}" ]]; then
   export ZENGRAM_DATA_DIR="$OPENCODE_PINNED_DATA_DIR"; mkdir -p "$ZENGRAM_DATA_DIR"; PINNED=1
 else
-  export ZENGRAM_DATA_DIR=$(mktemp -d /tmp/zengram-mem-XXXXXX); PINNED=0
+  export ZENGRAM_DATA_DIR=$(mktemp -d /tmp/zengram-strategy-XXXXXX); PINNED=0
 fi
-EVENTS_FILE="${OPENCODE_EVENTS_FILE:-$(mktemp /tmp/pi-zengram-events-XXXXXX.jsonl)}"
-PI_SESSION_DIR=$(mktemp -d /tmp/pi-zengram-session-XXXXXX)
+EVENTS_FILE="${OPENCODE_EVENTS_FILE:-$(mktemp /tmp/pi-strategy-events-XXXXXX.jsonl)}"
+PI_SESSION_DIR=$(mktemp -d /tmp/pi-strategy-session-XXXXXX)
 cleanup() {
   rm -f "$EVENTS_FILE"; rm -rf "$PI_SESSION_DIR"
   [[ "$PINNED" -eq 0 ]] && rm -rf "$ZENGRAM_DATA_DIR" || true
@@ -145,21 +140,22 @@ stop_pi() {
 run_once() {
   wait_for_bronco_idle
   : > "$EVENTS_FILE"
+  # Reset repo to HEAD so retries start from a clean slate. The test-runner's
+  # before_agent_start pre-check would otherwise see the prior run's edits,
+  # set allPassed=true, and suppress per-edit feedback for the retry.
   git -C "$REPO" checkout -- . 2>/dev/null || true
   local model_args=()
   [[ -n "${PI_BENCH_MODEL:-}"    ]] && model_args+=(--model    "$PI_BENCH_MODEL")
   [[ -n "${PI_BENCH_PROVIDER:-}" ]] && model_args+=(--provider "$PI_BENCH_PROVIDER")
   [[ -n "${PI_BENCH_API_KEY:-}"  ]] && model_args+=(--api-key  "$PI_BENCH_API_KEY")
   [[ -n "${PI_BENCH_APPEND_PROMPT:-}" ]] && model_args+=(--append-system-prompt "$PI_BENCH_APPEND_PROMPT")
-  # --no-extensions disables discovery; explicit -e loads zengram + loop-guard only.
+  # --no-extensions disables auto-discovery; -e loads strategy + loop-guard only.
   ( cd "$REPO" && exec "$PI_BIN" \
       --print --mode json \
-      --no-extensions -e "$ZENGRAM_PI_EXT" "${loop_guard_args[@]}" --no-session \
+      --no-extensions -e "$ZENGRAM_PI_STRATEGY_EXT" "${loop_guard_args[@]}" --no-session \
       "${model_args[@]}" \
       "$(cat "$PROBLEM")" ) > "$EVENTS_FILE" 2>&1 &
   local pi_pid=$!
-  # Kill pi at the turn limit; also kill on stall (no new turn_start for
-  # BENCH_STALL_TIMEOUT_SECS, default 15 min) — parity with the other arms.
   (
     last_n=0
     last_change=$(date +%s)
@@ -238,7 +234,6 @@ if [[ ! -s "$PATCH" && -s "${PATCH}.attempt1" ]]; then
 fi
 rm -f "${PATCH}.attempt1" "${EVENTS_FILE}.attempt1"
 
-# ── Usage (same parser/schema as run-pi-baseline.sh) ─────────────────────────
 python3 - "$EVENTS_FILE" "$USAGE" "${PI_BENCH_MODEL:-}" <<'PY'
 import sys, json
 events_file, usage_file = sys.argv[1], sys.argv[2]
