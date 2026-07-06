@@ -33,7 +33,10 @@ done
 }
 
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
-EVENTS_FILE=$(mktemp /tmp/opencode-events-XXXXXX.jsonl)
+# OPENCODE_EVENTS_FILE — see run-zengram.sh for full rationale. The harness
+# pins this inside its tmpDir on bench invocations so it can recover real
+# turn/token counts when the watchdog SIGKILLs us mid-stream.
+EVENTS_FILE="${OPENCODE_EVENTS_FILE:-$(mktemp /tmp/opencode-events-XXXXXX.jsonl)}"
 # Each run gets its own XDG_DATA_HOME so SQLite and any cached state are
 # isolated — prevents cross-run corruption from crashes or interrupts.
 RUN_DATA_DIR=$(mktemp -d /tmp/opencode-baseline-data-XXXXXX)
@@ -137,11 +140,16 @@ git -C "$REPO" diff HEAD > "$PATCH"
 # Trajectory data (tool calls, files touched, records) used to be reconstructed
 # here too, but opencode#22 added native `run --trajectory-json` support — we
 # pass that flag through above and opencode writes the file directly.
-python3 - "$EVENTS_FILE" "$USAGE" <<'PY'
+python3 - "$EVENTS_FILE" "$USAGE" "${OPENCODE_BENCH_MODEL:-}" <<'PY'
 import sys, json
 
 events_file = sys.argv[1]
 usage_file  = sys.argv[2]
+# The model the adapter asked opencode to use. Captured here (not by the TS
+# harness) because the adapter is the layer that actually sees OPENCODE_BENCH_MODEL
+# turn into a `--model` arg. Empty string = no --model passed, meaning opencode
+# auto-picked from its recent-model cache (the 2026-05-15 silent-drift trap).
+model = sys.argv[3] if len(sys.argv) > 3 else ""
 
 turns = 0
 prompt_tok = 0
@@ -176,5 +184,6 @@ with open(usage_file, "w") as f:
         "completion_tokens": completion_tok,
         "cache_read_tokens": cache_read_tok,
         "turns_with_cache_hit": turns_with_cache_hit,
+        "model": model,
     }, f)
 PY

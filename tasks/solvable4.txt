@@ -1,0 +1,8 @@
+# 4 tasks confirmed solvable by Qwen3-Coder-Next (opencode archive 2026-06-15)
+# These are used as a capability-matched test bed for baseline vs zengram comparison.
+# 11099: both arms solved  | 13670: both solved (zengram 40% more turns)
+# 14089: both solved fast  | 14559: only zengram solved (most interesting)
+django__django-11099
+django__django-13670
+django__django-14089
+django__django-14559

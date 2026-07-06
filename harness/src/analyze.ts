@@ -392,6 +392,8 @@ export function buildAnalysis(): Analysis {
     by_variant: {
       baseline: aggregate("baseline", per_run),
       zengram:  aggregate("zengram",  per_run),
+      strategy: aggregate("strategy", per_run),
+      both:     aggregate("both",     per_run),
     },
   };
 }
@@ -421,6 +423,8 @@ export function buildAnalysisWithIntegrity(): { analysis: Analysis; integrity: I
     by_variant: {
       baseline: aggregate("baseline", per_run),
       zengram:  aggregate("zengram",  per_run),
+      strategy: aggregate("strategy", per_run),
+      both:     aggregate("both",     per_run),
     },
   };
   return { analysis, integrity };
@@ -465,44 +469,62 @@ export function writeAnalysis(a: Analysis): string {
 }
 
 export function printAnalysis(a: Analysis): void {
-  const { baseline, zengram } = a.by_variant;
   const fmtPct = (n: number) => `${(n * 100).toFixed(1)}%`;
   const fmtK   = (n: number) => `${(n / 1000).toFixed(1)}k`;
 
+  // Only show variants that have data.
+  const activeVariants = (["baseline", "zengram", "strategy", "both"] as Variant[]).filter(
+    (v) => a.by_variant[v].n_runs > 0,
+  );
+
+  if (activeVariants.length === 0) {
+    console.log("No trajectory data found.");
+    return;
+  }
+
+  const colWidth = 14;
+  const labelWidth = 28;
+  function rowN(label: string, ...cols: string[]): string {
+    return label.padEnd(labelWidth) + cols.map((c) => c.padEnd(colWidth)).join(" ");
+  }
+
   console.log("\n═══ Trajectory analysis ═════════════════════════════════════════\n");
-  console.log(row("Metric", "Baseline", "Zengram"));
-  console.log("─".repeat(60));
-  console.log(row("n_runs (with trajectory)", String(baseline.n_runs), String(zengram.n_runs)));
-  console.log(row("Resolved", `${baseline.n_resolved}/${baseline.n_runs}`, `${zengram.n_resolved}/${zengram.n_runs}`));
-  console.log(row("Resolution rate", fmtPct(baseline.resolution_rate), fmtPct(zengram.resolution_rate)));
-  console.log(row("Total tokens", fmtK(baseline.total_tokens), fmtK(zengram.total_tokens)));
-  console.log(row("Resolved / 1M tok ★", baseline.resolved_per_million_tokens.toFixed(2), zengram.resolved_per_million_tokens.toFixed(2)));
-  console.log(row("Median tokens / run", fmtK(baseline.median_total_tokens), fmtK(zengram.median_total_tokens)));
-  console.log(row("Median turns / run", baseline.median_turns.toFixed(1), zengram.median_turns.toFixed(1)));
+  console.log(rowN("Metric", ...activeVariants.map((v) => v.charAt(0).toUpperCase() + v.slice(1))));
+  console.log("─".repeat(labelWidth + activeVariants.length * (colWidth + 1)));
+  const getN  = (v: Variant) => a.by_variant[v];
+  console.log(rowN("n_runs (with trajectory)", ...activeVariants.map((v) => String(getN(v).n_runs))));
+  console.log(rowN("Resolved", ...activeVariants.map((v) => `${getN(v).n_resolved}/${getN(v).n_runs}`)));
+  console.log(rowN("Resolution rate", ...activeVariants.map((v) => fmtPct(getN(v).resolution_rate))));
+  console.log(rowN("Total tokens", ...activeVariants.map((v) => fmtK(getN(v).total_tokens))));
+  console.log(rowN("Resolved / 1M tok ★", ...activeVariants.map((v) => getN(v).resolved_per_million_tokens.toFixed(2))));
+  console.log(rowN("Median tokens / run", ...activeVariants.map((v) => fmtK(getN(v).median_total_tokens))));
+  console.log(rowN("Median turns / run", ...activeVariants.map((v) => getN(v).median_turns.toFixed(1))));
 
   console.log("\n─── Wasted-action distribution ──────────────────────────────────\n");
-  console.log(row("Tag", "Baseline", "Zengram"));
-  console.log("─".repeat(60));
+  console.log(rowN("Tag", ...activeVariants.map((v) => v.charAt(0).toUpperCase() + v.slice(1))));
+  console.log("─".repeat(labelWidth + activeVariants.length * (colWidth + 1)));
   const tags: WasteTag[] = ["useful", "redundant_read", "premature_test", "lint_only", "error_retry"];
   for (const t of tags) {
-    const b = baseline.tag_distribution[t];
-    const z = zengram.tag_distribution[t];
-    const bs = baseline.tag_share[t] ?? 0;
-    const zs = zengram.tag_share[t] ?? 0;
-    console.log(row(t, `${b} (${fmtPct(bs)})`, `${z} (${fmtPct(zs)})`));
+    console.log(rowN(t, ...activeVariants.map((v) => {
+      const agg = getN(v);
+      return `${agg.tag_distribution[t]} (${fmtPct(agg.tag_share[t] ?? 0)})`;
+    })));
   }
 
   console.log("\n─── Run flags ───────────────────────────────────────────────────\n");
-  console.log(row("Flag", "Baseline", "Zengram"));
-  console.log("─".repeat(60));
+  console.log(rowN("Flag", ...activeVariants.map((v) => v.charAt(0).toUpperCase() + v.slice(1))));
+  console.log("─".repeat(labelWidth + activeVariants.length * (colWidth + 1)));
   for (const f of ["no_edit", "high_redundancy"] as RunFlag[]) {
-    console.log(row(f, String(baseline.run_flag_counts[f]), String(zengram.run_flag_counts[f])));
+    console.log(rowN(f, ...activeVariants.map((v) => String(getN(v).run_flag_counts[f]))));
   }
 
-  if (baseline.top_redundant_files.length > 0 || zengram.top_redundant_files.length > 0) {
-    console.log("\n─── Top redundantly-read files (zengram) ────────────────────────\n");
-    for (const f of zengram.top_redundant_files.slice(0, 5)) {
-      console.log(`  ${f.redundant_reads}× across ${f.runs} run(s)  ${trimPath(f.path)}`);
+  for (const v of activeVariants) {
+    const agg = getN(v);
+    if (agg.top_redundant_files.length > 0) {
+      console.log(`\n─── Top redundantly-read files (${v}) ─────────────────────────────\n`);
+      for (const f of agg.top_redundant_files.slice(0, 5)) {
+        console.log(`  ${f.redundant_reads}× across ${f.runs} run(s)  ${trimPath(f.path)}`);
+      }
     }
   }
   console.log("");

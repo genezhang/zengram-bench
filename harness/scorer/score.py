@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -30,11 +31,12 @@ from pathlib import Path
 # for RUNS_DIR/SCORES_DIR/TASKS_CACHE but REPO_CACHE has no override so the
 # local-clone fast path silently never matched. Fixing the depth makes all
 # defaults resolve correctly.
-ROOT        = Path(__file__).resolve().parents[2]
-RUNS_DIR    = ROOT / "results" / "runs"
-SCORES_DIR  = ROOT / "results" / "scores"
-TASKS_CACHE = ROOT / "tasks" / "cache" / "tasks.json"
-REPO_CACHE  = ROOT / "results" / "repo-cache"
+ROOT         = Path(__file__).resolve().parents[2]
+RUNS_DIR     = ROOT / "results" / "runs"
+SCORES_DIR   = ROOT / "results" / "scores"
+TASKS_CACHE  = ROOT / "tasks" / "cache" / "tasks.json"
+REPO_CACHE   = ROOT / "results" / "repo-cache"
+BASELINES_DIR = ROOT / "results" / "baselines"
 
 
 def load_tasks(cache_path: Path) -> dict[str, dict]:
@@ -43,6 +45,37 @@ def load_tasks(cache_path: Path) -> dict[str, dict]:
         print("Run: python setup_tasks.py")
         sys.exit(1)
     return {t["task_id"]: t for t in json.loads(cache_path.read_text())}
+
+
+def _patch_target_files(patch: str) -> list[str]:
+    """Files a unified diff modifies, taken from its `+++ b/<path>` headers."""
+    return re.findall(r'^\+\+\+ b/(.+?)\s*$', patch, re.M)
+
+
+def strip_test_file_hunks(patch: str, test_files: set[str]) -> tuple[str, list[str]]:
+    """Drop per-file sections of `patch` that touch any file in `test_files`.
+
+    Canonical SWE-bench semantics: the gold `test_patch` is authoritative for
+    test files, and an agent's edits to those files are ignored (the official
+    harness force-resets them). Our scorer applies `test_patch` first, so if the
+    agent ALSO edited a test file its hunks collide on `git apply` → a false
+    "patch apply failed". Splitting on `diff --git` boundaries and dropping the
+    sections whose target is a test_patch file makes the agent's source-only
+    change apply cleanly. Returns (filtered_patch, dropped_files)."""
+    if not test_files:
+        return patch, []
+    sections = re.split(r'(?m)(?=^diff --git )', patch)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for sec in sections:
+        if not sec.strip():
+            continue
+        targets = _patch_target_files(sec)
+        if targets and all(t in test_files for t in targets):
+            dropped.extend(targets)
+        else:
+            kept.append(sec)
+    return "".join(kept), dropped
 
 
 _DJANGO_TEST_ID = re.compile(r'^(\S+)\s*\((.+)\)$')
@@ -55,9 +88,86 @@ def _to_dotted(test_id: str) -> str:
     return f"{m.group(2)}.{m.group(1)}" if m else test_id
 
 
-def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]]:
+def _is_runnable(test_id: str) -> bool:
+    """Return True only for proper `method (mod.Class)` test IDs.
+
+    SWE-bench sometimes records unittest shortDescription() output as test IDs
+    — e.g. "SIGINT is ignored in Python and passed to psql to abort quries."
+    These are docstring labels, not invocable identifiers. They can't be
+    converted to a valid dotted path and will always fail to run, producing
+    false "not resolved" verdicts even when the underlying fix is correct.
+    Filter them out; they're counted as "skipped" rather than "failed".
     """
-    Run the given test IDs via Django's runtests.py and return (passed, failed).
+    return bool(_DJANGO_TEST_ID.match(test_id))
+
+
+# A parenthesised dotted test path with at least module.Class.method structure
+# (>=1 dot).  Deliberately strict so tracebacks like `basename(_sys.argv[0])`
+# or `%(prog)s` don't get mistaken for a test id.
+_ID_RE = re.compile(r'\(([A-Za-z_]\w*(?:\.\w+)+)\)')
+_VERDICTS = r'ok|FAIL|ERROR|skipped|expected failure|unexpected success'
+_INLINE_VERDICT_RE = re.compile(r'\.\.\.\s*(' + _VERDICTS + r')\b', re.IGNORECASE)
+_BARE_VERDICT_RE = re.compile(r'^\s*(' + _VERDICTS + r')\b', re.IGNORECASE)
+
+
+def _display(full: str) -> str:
+    """`mod.Class.method` → the original `method (mod.Class)` id form."""
+    mod_class, _, method = full.rpartition(".")
+    return f"{method} ({mod_class})" if mod_class else full
+
+
+def _parse_verdicts(stderr: str) -> dict:
+    """
+    Map each test's `method (mod.Class)` id → "passed"/"failed" from
+    runtests.py --verbosity=2 output.
+
+    A naive single-line regex (`^id ... verdict`) is WRONG for two reasons:
+      1. When a test method has a DOCSTRING, unittest's descriptions mode
+         prints the id and the docstring on separate lines and attaches the
+         verdict to the docstring line, which carries no (mod.Class.method):
+             test_x (mod.Class.test_x)
+             <docstring first line> ... ok
+      2. Django's "Testing against Django installed in …" banner can
+         interleave between the " ... " and the verdict, pushing the verdict
+         onto its own line:
+             test_x (mod.Class.test_x)
+             <docstring> ... Testing against Django installed in '…'
+             ok
+    A test whose verdict is never found is scored "missing" → FAILED, so a
+    correct patch on a docstring'd test would look unresolved forever.  Parse
+    statefully instead: remember the last test id, attach the next verdict
+    token (inline or on its own line) to it.  setdefault keeps the first
+    (real, inline) verdict and ignores the trailing FAIL:/ERROR: summary block.
+    """
+    outcome: dict = {}
+    pending = None
+    for line in stderr.splitlines():
+        idm = _ID_RE.search(line)
+        ivm = _INLINE_VERDICT_RE.search(line)
+        if idm and ivm:                         # non-docstring: id + verdict together
+            outcome.setdefault(_display(idm.group(1)),
+                               "passed" if ivm.group(1).lower() == "ok" else "failed")
+            pending = None
+        elif ivm and pending is not None:       # verdict on the docstring line
+            outcome.setdefault(pending,
+                               "passed" if ivm.group(1).lower() == "ok" else "failed")
+            pending = None
+        elif idm:                               # id line, verdict deferred
+            pending = _display(idm.group(1))
+        else:
+            bvm = _BARE_VERDICT_RE.match(line)
+            if bvm and pending is not None:     # verdict pushed onto its own line
+                outcome.setdefault(pending,
+                                   "passed" if bvm.group(1).lower() == "ok" else "failed")
+                pending = None
+    return outcome
+
+
+def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """
+    Run the given test IDs via Django's runtests.py and return
+    (passed, failed, skipped).  `skipped` contains entries that aren't in
+    `method (mod.Class)` format (docstring labels) and can't be run.
 
     Uses runtests.py (Django's own unittest-based runner) rather than pytest
     because SWE-bench Django tasks ship test IDs in unittest's
@@ -65,9 +175,17 @@ def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]
     translate to dotted form and parse runtests.py's verbose output.
     """
     if not test_ids:
-        return [], []
+        return [], [], []
 
-    dotted = [_to_dotted(t) for t in test_ids]
+    runnable = [t for t in test_ids if _is_runnable(t)]
+    skipped  = [t for t in test_ids if not _is_runnable(t)]
+    if skipped:
+        print(f"\n    [scorer] skipping {len(skipped)} unrunnable (docstring) ID(s)",
+              end=" ", flush=True)
+    if not runnable:
+        return [], [], skipped
+
+    dotted = [_to_dotted(t) for t in runnable]
     try:
         result = subprocess.run(
             [
@@ -89,42 +207,59 @@ def run_tests(repo_dir: Path, test_ids: list[str]) -> tuple[list[str], list[str]
     except subprocess.TimeoutExpired:
         return [], test_ids   # treat timeout as all-failed
 
-    # runtests --verbosity=2 prints lines like:
-    #   test_reversed (utils_tests.test_datastructures.OrderedSetTests.test_reversed) ... ok
-    #   test_X (mod.Class.test_X) ... FAIL
-    #   test_Y (mod.Class.test_Y) ... ERROR
-    # Parse stderr (where unittest writes verbose output) line-by-line.
-    outcome: dict[str, str] = {}
-    for line in result.stderr.splitlines():
-        # Match the dotted path inside parens; strip a trailing `.method` so
-        # we recover the original `method (mod.Class)` form for lookup.
-        m = re.match(r'^\S+\s*\((\S+)\)\s*\.\.\.\s*(\w+)', line)
-        if not m:
-            continue
-        full = m.group(1)               # e.g. mod.Class.method
-        verdict = m.group(2).lower()    # ok | FAIL | ERROR | skipped
-        # Translate full back to the original `method (mod.Class)` form so
-        # the caller's test_ids list can match.
-        parts = full.rsplit(".", 1)
-        if len(parts) == 2:
-            mod_class, method = parts
-            display = f"{method} ({mod_class})"
-        else:
-            display = full
-        outcome[display] = "passed" if verdict == "ok" else "failed"
+    outcome = _parse_verdicts(result.stderr)
 
     passed, failed = [], []
-    for tid in test_ids:
-        result = outcome.get(tid, "missing")
-        if result == "passed":
+    for tid in runnable:
+        res = outcome.get(tid, "missing")
+        if res == "passed":
             passed.append(tid)
         else:
             failed.append(tid)
 
-    return passed, failed
+    return passed, failed, skipped
 
 
-def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False) -> dict:
+def get_ptp_preexisting(task: dict, repo_dir: Path, baselines_dir: Path,
+                        rebaseline: bool = False) -> set[str]:
+    """Return the set of pass_to_pass tests that were ALREADY failing at
+    base_commit + test_patch (before any agent fix).
+
+    These are pre-existing failures in the benchmark's test suite and should
+    NOT be counted as regressions introduced by the agent's patch.  Without
+    filtering them, tasks like 11728 and 13513 are unsolvable even when the
+    agent's source fix is correct.
+
+    The result is cached per task_id so we only run the tests once regardless
+    of how many runs exist for that task.
+    """
+    ptp = task.get("pass_to_pass", [])
+    if not ptp:
+        return set()
+
+    baselines_dir.mkdir(parents=True, exist_ok=True)
+    baseline_file = baselines_dir / f"{task['task_id']}_baseline.json"
+
+    if baseline_file.exists() and not rebaseline:
+        cached = json.loads(baseline_file.read_text())
+        return set(cached.get("ptp_preexisting", []))
+
+    print(f"\n    [scorer] computing ptp baseline for {task['task_id']} …", end=" ", flush=True)
+    _, ptp_pre, _ = run_tests(repo_dir, ptp)
+    baseline_file.write_text(json.dumps({
+        "task_id": task["task_id"],
+        "base_commit": task.get("base_commit", ""),
+        "ptp_preexisting": ptp_pre,
+    }, indent=2))
+    if ptp_pre:
+        print(f"({len(ptp_pre)} pre-existing failures cached)", flush=True)
+    else:
+        print("(0 pre-existing failures)", flush=True)
+    return set(ptp_pre)
+
+
+def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False,
+              baselines_dir: Path = BASELINES_DIR, rebaseline: bool = False) -> dict:
     task_id = run["task_id"]
     variant = run["variant"]
     run_idx = run["run_index"]
@@ -246,14 +381,42 @@ def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False) -> d
                     "scorer_error": f"test_patch apply failed: {tpa.stderr.strip()}",
                 })
 
-        # Apply agent patch.
+        # Install the project under test before running any tests (baseline or
+        # final). --break-system-packages is required on Python 3.12+ where
+        # PEP 668 marks system Python as externally managed.  Use
+        # sys.executable -m pip so the install lands in the same interpreter
+        # run_tests() will use.
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-e", ".",
+             "--quiet", "--no-input", "--break-system-packages"],
+            cwd=repo_dir, capture_output=True,
+        )
+        # No pytest install: run_tests() shells out to Django's tests/runtests.py.
+
+        # Compute (or load from cache) the set of ptp tests that were ALREADY
+        # failing before the agent's patch.  We run them here — after test_patch
+        # and install but before agent_patch — so the baseline reflects exactly
+        # the state the test suite starts from.  The result is cached per
+        # task_id, so only the first run per task pays the extra test time.
+        ptp_preexisting = get_ptp_preexisting(task, repo_dir, baselines_dir, rebaseline)
+
+        # Apply agent patch — but first drop any hunks touching files the gold
+        # test_patch owns. Those are already applied above and are authoritative;
+        # an agent that ALSO edited a test fixture would otherwise collide on
+        # `git apply` and be falsely scored "patch apply failed" despite a
+        # correct source fix (canonical SWE-bench ignores agent test edits).
+        test_files = set(_patch_target_files(task.get("test_patch", "")))
+        patch_to_apply, dropped = strip_test_file_hunks(patch, test_files)
+        if dropped:
+            print(f"  (ignoring agent edits to test file(s): {', '.join(sorted(set(dropped)))})")
+        agent_patch_was_test_only = bool(patch.strip()) and not patch_to_apply.strip()
         patch_file = Path(tmp) / "agent.patch"
-        patch_file.write_text(patch)
+        patch_file.write_text(patch_to_apply)
         apply = subprocess.run(
             ["git", "-C", str(repo_dir), "apply", "--whitespace=fix", str(patch_file)],
             capture_output=True, text=True,
-        )
-        if apply.returncode != 0:
+        ) if patch_to_apply.strip() else None
+        if apply is not None and apply.returncode != 0:
             print("patch apply failed")
             return write({
                 "task_id": task_id, "variant": variant, "run_index": run_idx,
@@ -262,51 +425,54 @@ def score_run(run: dict, task: dict, scores_dir: Path, force: bool = False) -> d
                 "pass_to_pass_passed": [], "pass_to_pass_failed": task["pass_to_pass"],
                 "scorer_error": f"git apply failed: {apply.stderr.strip()}",
             })
-
-        # Install the project under test. --break-system-packages is required
-        # on Python 3.12+ where PEP 668 marks system Python as externally
-        # managed and pip refuses without it (or a venv); per-run venv would
-        # be cleaner but adds ~5 s/run × 30 runs.
-        # Use `sys.executable -m pip` so the install lands in the same
-        # interpreter run_tests() will use — a bare `pip` on PATH may point
-        # at a different Python and the install would silently land elsewhere,
-        # making valid runs look unresolved on import errors.
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", ".",
-             "--quiet", "--no-input", "--break-system-packages"],
-            cwd=repo_dir, capture_output=True,
-        )
-        # No pytest install: run_tests() shells out to Django's tests/runtests.py,
-        # not pytest. The previous pytest+pytest-json-report install was dead
-        # weight after that switch.
+        if agent_patch_was_test_only:
+            # Agent changed ONLY test files → no source fix to evaluate.
+            print("agent patch was test-only (no source change)")
 
         # Run tests with structured reporting.
-        ftp_passed, ftp_failed = run_tests(repo_dir, task["fail_to_pass"])
-        ptp_passed, ptp_failed = run_tests(repo_dir, task["pass_to_pass"])
+        ftp_passed, ftp_failed, ftp_skipped = run_tests(repo_dir, task["fail_to_pass"])
+        ptp_passed, ptp_failed, ptp_skipped = run_tests(repo_dir, task["pass_to_pass"])
 
-        resolved = len(ftp_failed) == 0 and len(ptp_failed) == 0
+        # resolved: all runnable ftp tests pass AND no NEW ptp regressions.
+        # "New" = failing post-patch but NOT in the pre-existing baseline set.
+        # Unrunnable (docstring-label) entries are counted as skipped, not failed.
+        ptp_failed_new = [t for t in ptp_failed if t not in ptp_preexisting]
+        resolved = len(ftp_failed) == 0 and len(ptp_failed_new) == 0
         print("resolved ✓" if resolved else "not resolved ✗")
-        return write({
+        result = {
             "task_id": task_id, "variant": variant, "run_index": run_idx,
             "resolved": resolved,
             "fail_to_pass_passed": ftp_passed, "fail_to_pass_failed": ftp_failed,
             "pass_to_pass_passed": ptp_passed, "pass_to_pass_failed": ptp_failed,
-        })
+            "pass_to_pass_failed_new": ptp_failed_new,
+        }
+        if ptp_preexisting:
+            result["ptp_preexisting_count"] = len(ptp_preexisting)
+        if ftp_skipped:
+            result["fail_to_pass_skipped"] = ftp_skipped
+        if ptp_skipped:
+            result["pass_to_pass_skipped"] = ptp_skipped
+        return write(result)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Score agent run results")
-    parser.add_argument("--runs-dir",    default=str(RUNS_DIR))
-    parser.add_argument("--scores-dir",  default=str(SCORES_DIR))
-    parser.add_argument("--tasks-cache", default=str(TASKS_CACHE))
-    parser.add_argument("--task-id",     help="Score only this task ID")
-    parser.add_argument("--force", action="store_true",
+    parser.add_argument("--runs-dir",      default=str(RUNS_DIR))
+    parser.add_argument("--scores-dir",    default=str(SCORES_DIR))
+    parser.add_argument("--tasks-cache",   default=str(TASKS_CACHE))
+    parser.add_argument("--baselines-dir", default=str(BASELINES_DIR))
+    parser.add_argument("--task-id",       help="Score only this task ID")
+    parser.add_argument("--force",      action="store_true",
                         help="Re-score even when score file exists with matching patch hash")
+    parser.add_argument("--rebaseline", action="store_true",
+                        help="Recompute ptp baselines (pre-existing failure cache) even if cached")
     args = parser.parse_args()
 
-    runs_dir   = Path(args.runs_dir)
-    scores_dir = Path(args.scores_dir)
+    runs_dir      = Path(args.runs_dir)
+    scores_dir    = Path(args.scores_dir)
+    baselines_dir = Path(args.baselines_dir)
     scores_dir.mkdir(parents=True, exist_ok=True)
+    baselines_dir.mkdir(parents=True, exist_ok=True)
 
     tasks = load_tasks(Path(args.tasks_cache))
 
@@ -325,17 +491,60 @@ def main():
         if task_id not in tasks:
             print(f"  WARNING: task {task_id} not in cache, skipping")
             continue
-        score_run(run, tasks[task_id], scores_dir, force=args.force)
+        score_run(run, tasks[task_id], scores_dir, force=args.force,
+                  baselines_dir=baselines_dir, rebaseline=args.rebaseline)
 
-    # Quick summary.
+    # Quick summary — all variants present in the scores dir.
     score_files = list(scores_dir.glob("*.json"))
     scores = [json.loads(f.read_text()) for f in score_files]
-    for variant in ("baseline", "zengram"):
+    all_variants = sorted({s["variant"] for s in scores})
+    print()
+    for variant in all_variants:
         vs = [s for s in scores if s["variant"] == variant]
         if not vs:
             continue
         resolved = sum(1 for s in vs if s["resolved"])
-        print(f"\n{variant}: {resolved}/{len(vs)} runs resolved ({100*resolved/len(vs):.1f}%)")
+        print(f"{variant:10s}: {resolved:3d}/{len(vs):3d} runs resolved ({100*resolved/len(vs):.1f}%)")
+
+    # Per-task breakdown.
+    all_task_ids = sorted({s["task_id"] for s in scores})
+    print()
+    header = f"{'Task':40s}" + "".join(f"  {v:10s}" for v in all_variants)
+    print(header)
+    print("-" * len(header))
+    for tid in all_task_ids:
+        row = f"{tid:40s}"
+        for variant in all_variants:
+            vs = [s for s in scores if s["task_id"] == tid and s["variant"] == variant]
+            if not vs:
+                row += f"  {'—':10s}"
+            else:
+                resolved = sum(1 for s in vs if s["resolved"])
+                marks = "".join("✓" if s["resolved"] else "✗" for s in sorted(vs, key=lambda x: x["run_index"]))
+                row += f"  {marks} {resolved}/{len(vs)}"
+        print(row)
+
+    # Report cached ptp baselines — pre-existing failures that are now
+    # correctly excluded from the resolved criterion.
+    baseline_files = sorted(Path(args.baselines_dir).glob("*_baseline.json"))
+    tasks_with_preexisting = []
+    for bf in baseline_files:
+        try:
+            data = json.loads(bf.read_text())
+        except Exception:
+            continue
+        pre = data.get("ptp_preexisting", [])
+        if pre:
+            tasks_with_preexisting.append((data["task_id"], pre))
+
+    if tasks_with_preexisting:
+        print("\n─── ptp baselines: pre-existing failures excluded from resolved ──")
+        for tid, pre in tasks_with_preexisting:
+            print(f"  {tid}: {len(pre)} test(s) excluded")
+            for t in sorted(pre)[:1]:
+                print(f"    e.g. {t!r}")
+            if len(pre) > 1:
+                print(f"    … and {len(pre)-1} more")
 
     print("\nNext: bench report")
 

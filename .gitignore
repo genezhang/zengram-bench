@@ -1,18 +1,21 @@
 node_modules/
 dist/
-# Ignore result data but keep the placeholder dirs so they exist after clone
-results/runs/*.json
-results/scores/*.json
-results/repo-cache/
-# Ad-hoc archive dirs operators move stale runs into between bench passes —
-# never the same shape twice, never source code, never useful in git.
-results/runs/_archive_*/
-results/runs-archive-*/
-results/runs_archive_*/
-# Multi-session pinned XDG_DATA_HOME dirs (zengram state across reps)
-results/multi-session-state/
-# `bench analyze` output — derived from runs+scores, regenerable
-results/analysis.json
+# Everything under results/ is regenerable bench data / experiment output —
+# never source code. Ignore ALL of it, keeping only the placeholder .gitkeeps so
+# results/runs and results/scores still exist after a fresh clone. This one rule
+# deliberately covers everything the old near-miss patterns let slip: ad-hoc
+# archive dirs (results/_archive-*, hyphen, at the results/ root), experiment
+# dirs (exp*, pilot*), multi-session-state AND multi-session-state-qwen,
+# ablation*, baselines, runs-ornith, scores-ornith, scores_archive_*, etc.
+# Previously ~19 GB of this showed as untracked-but-not-ignored and could be
+# staged by a stray `git add`.
+results/*
+!results/runs/
+!results/scores/
+results/runs/*
+!results/runs/.gitkeep
+results/scores/*
+!results/scores/.gitkeep
 tasks/cache/*.json
 __pycache__/
 *.pyc

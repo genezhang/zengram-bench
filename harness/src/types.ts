@@ -8,10 +8,17 @@ export interface SweTask {
   fail_to_pass: string[];   // tests that must newly pass
   pass_to_pass: string[];   // tests that must continue to pass
   environment_setup_commit: string;
+  test_patch?: string;      // unified diff that adds/modifies test cases for FTP tests
 }
 
-/** Which agent variant to run. */
-export type Variant = "baseline" | "zengram";
+/**
+ * Which agent variant to run.
+ *   baseline  — vanilla agent, no extensions
+ *   zengram   — code-level memory (zengram-memory.ts)
+ *   strategy  — phase guide + outcome storage (zengram-strategy.ts)
+ *   both      — memory + strategy together (zengram-memory.ts + zengram-strategy.ts)
+ */
+export type Variant = "baseline" | "zengram" | "strategy" | "both";
 
 /** One tool invocation captured from the run --format json event stream. */
 export interface ToolCallRecord {
@@ -60,6 +67,10 @@ export interface RunResult {
   turns_with_cache_hit: number;
   duration_ms: number;
   error?: string;       // set if status !== "completed"
+  model?: string;       // provider/model the agent was asked to use (from OPENCODE_BENCH_MODEL).
+                        // Empty string if unset — that means opencode's recent-model auto-pick
+                        // selected the provider, which has historically caused silent drift
+                        // to opencode/qwen3.6-plus-free (2026-05-15 incident).
   session_id?: string;  // Zengram session ID (zengram variant only)
   trajectory?: Trajectory;  // present when adapter supports --trajectory-json
 }
